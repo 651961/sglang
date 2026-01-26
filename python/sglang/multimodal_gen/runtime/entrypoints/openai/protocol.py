@@ -88,6 +88,7 @@ class VideoGenerationsRequest(BaseModel):
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
     output_path: Optional[str] = None
+    adjust_frames: Optional[bool] = None  # None means use default (True)
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 

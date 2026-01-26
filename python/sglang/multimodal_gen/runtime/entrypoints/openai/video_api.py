@@ -78,6 +78,8 @@ def _build_sampling_params_from_request(
     }
     if request.num_inference_steps is not None:
         sampling_kwargs["num_inference_steps"] = request.num_inference_steps
+    if request.adjust_frames is not None:
+        sampling_kwargs["adjust_frames"] = request.adjust_frames
     if request.guidance_scale is not None:
         sampling_kwargs["guidance_scale"] = request.guidance_scale
     if request.guidance_scale_2 is not None:
@@ -173,6 +175,7 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    adjust_frames: Optional[bool] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -212,6 +215,9 @@ async def create_video(
         num_frames_val = (
             num_frames if num_frames is not None else extra_from_form.get("num_frames")
         )
+        adjust_frames_val = (
+            adjust_frames if adjust_frames is not None else extra_from_form.get("adjust_frames")
+        )
 
         req = VideoGenerationsRequest(
             prompt=prompt,
@@ -226,6 +232,7 @@ async def create_video(
             negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            adjust_frames=adjust_frames_val,
             **(
                 {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
             ),

@@ -28,8 +28,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.1", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.1",
+  "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.2",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -95,7 +95,7 @@ diffusion = [
   "remote-pdb",
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
-  "runai_model_streamer",
+  "runai_model_streamer>=0.15.5",
   "cache-dit==1.2.0"
 ]
 

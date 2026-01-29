@@ -27,7 +27,7 @@ import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
-from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
     is_cuda,
@@ -182,7 +183,14 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
-MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep", "flashinfer"]
+MOE_A2A_BACKEND_CHOICES = [
+    "none",
+    "deepep",
+    "mooncake",
+    "mori",
+    "ascend_fuseep",
+    "flashinfer",
+]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -475,7 +483,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "ascend_fuseep", "flashinfer"
+        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -1174,6 +1182,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
+            "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
         ]:
@@ -1423,6 +1432,15 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch in ["Exaone4ForCausalLM"]:
+            if hf_config.sliding_window_pattern is not None:
+                # https://docs.sglang.ai/advanced_features/attention_backend.html
+                assert self.attention_backend in {
+                    "fa3",
+                    "triton",
+                    "trtllm_mha",
+                }, "fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
+                self.disable_hybrid_swa_memory = True
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
@@ -1449,14 +1467,11 @@ class ServerArgs:
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
         elif model_arch in ["KimiLinearForCausalLM"]:
-            logger.warning(
-                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=False,
             )
-            self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
             model_config = self.get_model_config()
             if model_config.quantization in [
                 "modelopt",
@@ -1475,30 +1490,11 @@ class ServerArgs:
                     self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
 
-            if not self.disable_radix_cache and self.speculative_algorithm is not None:
-                logger.warning(
-                    "Disabling radix cache since speculative decoding for NemotronHForCausalLM is not supported with radix cache yet."
-                )
-                self.disable_radix_cache = True
-            elif not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
-                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
-                if is_sm100_supported():
-                    if self.attention_backend is None:
-                        self.attention_backend = "flashinfer"
-                        logger.info(
-                            "Use flashinfer as attention backend on sm100 for NemotronHForCausalLM"
-                        )
-                    if self.attention_backend == "trtllm_mha":
-                        logger.warning(
-                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                            "Try to use --attention-backend triton if radix cache is necessary."
-                        )
-                        self.disable_radix_cache = True
-                        self.disable_overlap_schedule = False
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache_extra_buffer=False,
+                sm100_default_attention_backend="flashinfer",
+            )
             assert self.attention_backend != "triton", (
                 "NemotronHForCausalLM does not support triton attention backend,"
                 "as the first layer might not be an attention layer"
@@ -1541,21 +1537,12 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
-                if self.attention_backend is None:
-                    self.attention_backend = "triton"
-                    logger.info(
-                        "Use triton as attention backend on sm100 for Qwen3NextForCausalLM"
-                    )
-                if (
-                    not self.disable_radix_cache
-                    and self.attention_backend == "trtllm_mha"
-                ):
-                    logger.warning(
-                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                        "Try to use --attention-backend triton if radix cache is necessary."
-                    )
-                    self.disable_radix_cache = True
-                    self.disable_overlap_schedule = False
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache_extra_buffer=True,
+                sm100_default_attention_backend="triton",
+            )
+
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
@@ -1578,83 +1565,23 @@ class ServerArgs:
                             "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                         )
 
-            # Mamba radix cache v2
-            if self.enable_mamba_extra_buffer():
-                assert (
-                    is_cuda()
-                ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
-                if self.speculative_num_draft_tokens is not None:
-                    assert (
-                        self.mamba_track_interval >= self.speculative_num_draft_tokens
-                    ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
-
-                if self.page_size is not None:
-                    assert (
-                        self.mamba_track_interval % self.page_size == 0
-                    ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
-                    assert (
-                        max(FLA_CHUNK_SIZE, self.page_size)
-                        % min(FLA_CHUNK_SIZE, self.page_size)
-                        == 0
-                    ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
-
-            elif not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since MambaRadixCache no_buffer is not compatible with "
-                    "overlap schedule currently, try to use --mamba-scheduler-strategy extra_buffer to enable overlap schedule"
-                )
-                self.disable_overlap_schedule = True
-
         elif model_arch in [
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
         ]:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
-            if not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
-                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
-                if is_sm100_supported():
-                    if self.attention_backend is None:
-                        self.attention_backend = "triton"
-                        logger.info(
-                            f"Use triton as attention backend on sm100 for {model_arch}"
-                        )
-                    if self.attention_backend == "trtllm_mha":
-                        logger.warning(
-                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                            "Try to use --attention-backend triton if radix cache is necessary."
-                        )
-                        self.disable_radix_cache = True
-                        self.disable_overlap_schedule = False
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache_extra_buffer=False,
+                sm100_default_attention_backend="triton",
+            )
+
         elif model_arch in ["Lfm2ForCausalLM"]:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
-            if not self.disable_radix_cache:
-                logger.warning(
-                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
-                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
-                )
-                self.disable_overlap_schedule = True
-                if is_sm100_supported():
-                    if self.attention_backend is None:
-                        self.attention_backend = "flashinfer"
-                        logger.info(
-                            f"Use flashinfer as attention backend on sm100 for {model_arch}"
-                        )
-                    if self.attention_backend == "trtllm_mha":
-                        logger.warning(
-                            "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
-                            "Try to use --attention-backend flashinfer if radix cache is necessary."
-                        )
-                        self.disable_radix_cache = True
-                        self.disable_overlap_schedule = False
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache_extra_buffer=False,
+                sm100_default_attention_backend="flashinfer",
+            )
             assert self.attention_backend != "triton", (
                 f"{model_arch} does not support triton attention backend, "
                 "as the first layer might not be an attention layer"
@@ -1683,6 +1610,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "KimiK25ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and not self.enable_dp_attention
@@ -1691,6 +1619,72 @@ class ServerArgs:
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
+
+    def _handle_mamba_radix_cache(
+        self,
+        model_arch: str,
+        support_mamba_cache: bool = True,
+        support_mamba_cache_extra_buffer: bool = True,
+        sm100_default_attention_backend: str = None,
+    ):
+        if (
+            is_sm100_supported()
+            and self.attention_backend is None
+            and sm100_default_attention_backend is not None
+        ):
+            self.attention_backend = sm100_default_attention_backend
+            logger.info(
+                f"Use {sm100_default_attention_backend} as attention backend on sm100 for {model_arch}"
+            )
+
+        if not support_mamba_cache:
+            logger.warning(
+                f"Disabling Radix Cache for {model_arch} as it is not yet supported."
+            )
+            self.disable_radix_cache = True
+            return
+
+        if not support_mamba_cache_extra_buffer:
+            assert (
+                not self.enable_mamba_extra_buffer()
+            ), f"mamba extra_buffer is not supported for {model_arch} model"
+        elif self.enable_mamba_extra_buffer():  # extra_buffer
+            assert (
+                is_cuda()
+            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+            if self.speculative_num_draft_tokens is not None:
+                assert (
+                    self.mamba_track_interval >= self.speculative_num_draft_tokens
+                ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+
+            if self.page_size is not None:
+                assert (
+                    self.mamba_track_interval % self.page_size == 0
+                ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                assert (
+                    max(FLA_CHUNK_SIZE, self.page_size)
+                    % min(FLA_CHUNK_SIZE, self.page_size)
+                    == 0
+                ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
+        elif not self.disable_radix_cache:  # no_buffer
+            if self.speculative_algorithm is None:
+                logger.warning(
+                    "Disabling overlap schedule since mamba no_buffer is not compatible with "
+                    "overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
+                if self.attention_backend == "trtllm_mha":
+                    logger.warning(
+                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                        "Try to use --attention-backend triton if radix cache is necessary."
+                    )
+                    self.disable_radix_cache = True
+                    self.disable_overlap_schedule = False
+            else:
+                logger.warning(
+                    f"Disabling radix cache since speculative decoding for {model_arch} is not supported with radix cache yet."
+                )
+                self.disable_radix_cache = True
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -2090,6 +2084,18 @@ class ServerArgs:
                 "flashinfer_cutlass"
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
 
+        if self.moe_a2a_backend == "mori":
+            self.ep_size = self.tp_size
+            self.deepep_mode = "normal"
+            logger.warning("auto set deepep_mode=`normal` for MORI EP")
+            logger.warning(
+                f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+            assert (self.chunked_prefill_size) <= get_int_env_var(
+                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+            ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
@@ -2479,12 +2485,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Set the highest strict level for Kimi K2 tool calls
-        if (
-            self.tool_call_parser == "kimi_k2"
-            and not envs.SGLANG_TOOL_STRICT_LEVEL.is_set()
-        ):
-            envs.SGLANG_TOOL_STRICT_LEVEL.set(ToolStrictLevel.PARAMETER)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:

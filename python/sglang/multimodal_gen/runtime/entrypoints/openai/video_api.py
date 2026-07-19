@@ -36,7 +36,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     DEFAULT_VIDEO_SECONDS,
     add_common_data_to_response,
     build_sampling_params,
+    collect_json_form_fields,
+    collect_model_sampling_params,
     flatten_extra_params,
+    get_sampling_params_field_names,
+    get_sampling_params_cls,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -105,6 +109,23 @@ def _is_cosmos3_server(server_args) -> bool:
     from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 
     return isinstance(server_args.pipeline_config, Cosmos3Config)
+
+
+def _is_bernini_server(server_args) -> bool:
+    from sglang.multimodal_gen.configs.pipeline_configs.bernini import BerniniRConfig
+
+    return isinstance(server_args.pipeline_config, BerniniRConfig)
+
+
+def _resolve_generator_device(
+    request: VideoGenerationsRequest, server_args
+) -> str | None:
+    if (
+        _is_bernini_server(server_args)
+        and "generator_device" not in request.model_fields_set
+    ):
+        return None
+    return request.generator_device
 
 
 def _normalize_optional_string(value: Any) -> Any:
@@ -209,6 +230,20 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
     fps = request.fps if request.fps is not None else DEFAULT_FPS
     num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+    if _is_bernini_server(server_args):
+        # Preserve Bernini's official 81-frame/16-fps defaults. The OpenAI
+        # schema's implicit four seconds must not silently turn that into 96
+        # frames; an explicitly supplied ``seconds`` still behaves normally.
+        fps = request.fps
+        if request.num_frames is not None:
+            num_frames = request.num_frames
+        elif "seconds" in request.model_fields_set and request.seconds is not None:
+            effective_fps = fps
+            if effective_fps is None:
+                effective_fps = get_sampling_params_cls(server_args).fps
+            num_frames = effective_fps * request.seconds
+        else:
+            num_frames = None
     num_outputs = request.num_outputs_per_prompt
     if num_outputs is None:
         num_outputs = request.n or 1
@@ -223,6 +258,12 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
             cosmos3_kwargs["action_stats_path"] = (
                 server_args.pipeline_config.action_stats_path
             )
+    model_kwargs = collect_model_sampling_params(
+        request,
+        server_args,
+        exclude={"image_path", "output_file_name"},
+    )
+    model_kwargs.update(cosmos3_kwargs)
 
     return build_sampling_params(
         request_id,
@@ -237,17 +278,13 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         video_path=video_path,
         output_file_name=request_id,
         seed=request.seed,
-        generator_device=request.generator_device,
+        generator_device=_resolve_generator_device(request, server_args),
         num_inference_steps=request.num_inference_steps,
         guidance_scale=request.guidance_scale,
         guidance_scale_2=request.guidance_scale_2,
         negative_prompt=request.negative_prompt,
         max_sequence_length=request.max_sequence_length,
         flow_shift=request.flow_shift,
-        use_duration_template=_extra_value(request, "use_duration_template"),
-        use_resolution_template=_extra_value(request, "use_resolution_template"),
-        use_system_prompt=_extra_value(request, "use_system_prompt"),
-        use_guardrails=_extra_value(request, "use_guardrails"),
         enable_teacache=request.enable_teacache,
         enable_frame_interpolation=request.enable_frame_interpolation,
         frame_interpolation_exp=request.frame_interpolation_exp,
@@ -261,7 +298,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_quality=request.output_quality,
         perf_dump_path=request.perf_dump_path,
         diffusers_kwargs=request.diffusers_kwargs,
-        **cosmos3_kwargs,
+        **model_kwargs,
     )
 
 
@@ -482,7 +519,7 @@ async def create_video(
             return _parse_form_extra_value(selected)
 
         raw_form = await request.form()
-        for key in (
+        extra_form_fields = {
             "use_duration_template",
             "use_resolution_template",
             "use_system_prompt",
@@ -503,9 +540,10 @@ async def create_video(
             "action_normalization",
             "condition_frame_indexes_vision",
             "condition_video_keep",
-        ):
-            if key in raw_form and key not in extra_from_form:
-                extra_from_form[key] = _parse_form_extra_value(raw_form[key])
+        }
+        extra_form_fields.update(get_sampling_params_field_names(server_args))
+        for key, value in collect_json_form_fields(raw_form, extra_form_fields).items():
+            extra_from_form.setdefault(key, value)
         flatten_extra_params(extra_from_form)
 
         request_field_names = set(VideoGenerationsRequest.model_fields)
@@ -516,6 +554,13 @@ async def create_video(
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
+        generator_device_val = form_value("generator_device", generator_device)
+        if (
+            _is_bernini_server(server_args)
+            and "generator_device" not in raw_form
+            and "generator_device" not in extra_from_form
+        ):
+            generator_device_val = None
 
         req = VideoGenerationsRequest(
             prompt=prompt,
@@ -527,12 +572,12 @@ async def create_video(
             num_outputs_per_prompt=form_value(
                 "num_outputs_per_prompt", num_outputs_per_prompt
             ),
-            seconds=form_value("seconds", seconds) or 4,
+            seconds=form_value("seconds", seconds),
             size=form_value("size", size),
             fps=fps_val,
             num_frames=num_frames_val,
             seed=form_value("seed", seed),
-            generator_device=form_value("generator_device", generator_device),
+            generator_device=generator_device_val,
             negative_prompt=form_value("negative_prompt", negative_prompt),
             num_inference_steps=form_value("num_inference_steps", num_inference_steps),
             guidance_scale=form_value("guidance_scale", guidance_scale),

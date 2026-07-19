@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import inspect
 import json
 import os
 import time
@@ -32,7 +33,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
+    collect_json_form_fields,
+    collect_model_sampling_params,
     flatten_extra_params,
+    get_sampling_params_field_names,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -45,6 +49,42 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
+
+
+def _is_bernini_server(server_args) -> bool:
+    from sglang.multimodal_gen.configs.pipeline_configs.bernini import BerniniRConfig
+
+    return isinstance(server_args.pipeline_config, BerniniRConfig)
+
+
+def _resolve_request_size(request: ImageGenerationsRequest, server_args) -> str | None:
+    if _is_bernini_server(server_args) and "size" not in request.model_fields_set:
+        return None
+    return request.size
+
+
+def _resolve_generator_device(
+    request: ImageGenerationsRequest, server_args
+) -> str | None:
+    if (
+        _is_bernini_server(server_args)
+        and "generator_device" not in request.model_fields_set
+    ):
+        return None
+    return request.generator_device
+
+
+def _resolve_edit_inputs(
+    input_paths: list[str],
+    reference_image_paths: list[str] | None,
+    server_args,
+) -> tuple[str | list[str], list[str] | None]:
+    """Map OpenAI edit uploads to Bernini's edit-image/reference split."""
+    if not _is_bernini_server(server_args):
+        return input_paths, reference_image_paths
+
+    references = [*input_paths[1:], *(reference_image_paths or [])]
+    return input_paths[0], references or None
 
 
 def _get_extra_field(request, field_name):
@@ -237,6 +277,9 @@ async def generations(
     request_id = generate_request_id()
     server_args = get_global_server_args()
     is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
+    # OpenAI's generic image schema supplies 1024x1024 even when the caller
+    # omitted ``size``. Let Bernini's 848x480 sampling default win in that case.
+    request_size = _resolve_request_size(request, server_args)
     ext = (
         "png"
         if is_cosmos3 and request.output_format is None
@@ -247,7 +290,7 @@ async def generations(
         sampling = build_sampling_params(
             request_id,
             prompt=request.prompt,
-            size=request.size,
+            size=request_size,
             width=request.width,
             height=request.height,
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
@@ -255,7 +298,7 @@ async def generations(
             output_path=output_dir,
             num_frames=1,
             seed=request.seed,
-            generator_device=request.generator_device,
+            generator_device=_resolve_generator_device(request, server_args),
             num_inference_steps=request.num_inference_steps,
             guidance_scale=request.guidance_scale,
             true_cfg_scale=request.true_cfg_scale,
@@ -270,12 +313,6 @@ async def generations(
                 if request.flow_shift is not None
                 else _get_extra_field(request, "flow_shift")
             ),
-            use_duration_template=_get_extra_field(request, "use_duration_template"),
-            use_resolution_template=_get_extra_field(
-                request, "use_resolution_template"
-            ),
-            use_system_prompt=_get_extra_field(request, "use_system_prompt"),
-            use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
             output_compression=request.output_compression,
             output_quality=request.output_quality,
@@ -284,13 +321,21 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
-            use_pe=_get_extra_field(request, "use_pe"),
-            preset=_get_extra_field(request, "preset"),
             progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
             progressive_levels=_get_request_field_or_extra(
                 request, "progressive_levels"
             ),
             progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            **collect_model_sampling_params(
+                request,
+                server_args,
+                exclude={
+                    "num_frames",
+                    "num_outputs_per_prompt",
+                    "output_file_name",
+                    "output_path",
+                },
+            ),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
@@ -427,6 +472,30 @@ async def edits(
                 detail=f"Failed to process image source: {str(e)}",
             )
 
+        sampling_kwargs = {}
+        raw_form = await raw_request.form()
+        if _is_bernini_server(server_args) and "generator_device" not in raw_form:
+            generator_device = None
+        extra_fields = get_sampling_params_field_names(server_args) - set(
+            inspect.signature(edits).parameters
+        )
+        extra_fields -= {
+            "image_path",
+            "num_outputs_per_prompt",
+            "output_file_name",
+            "output_path",
+        }
+        sampling_kwargs.update(collect_json_form_fields(raw_form, extra_fields))
+
+        references = sampling_kwargs.pop("reference_image_paths", None)
+        if isinstance(references, str):
+            references = [references]
+        edit_image_path, references = _resolve_edit_inputs(
+            input_paths, references, server_args
+        )
+        if references:
+            sampling_kwargs["reference_image_paths"] = references
+
         ext = choose_output_image_ext(output_format, background)
         sampling = build_sampling_params(
             request_id,
@@ -435,7 +504,7 @@ async def edits(
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
-            image_path=input_paths,
+            image_path=edit_image_path,
             seed=seed,
             generator_device=generator_device,
             negative_prompt=negative_prompt,
@@ -449,6 +518,7 @@ async def edits(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            **sampling_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

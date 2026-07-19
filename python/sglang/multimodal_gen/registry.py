@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
+    BerniniConfig,
+    BerniniRConfig,
     Cosmos3Config,
     FastHunyuanConfig,
     FluxPipelineConfig,
@@ -100,6 +102,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
+)
+from sglang.multimodal_gen.configs.sample.bernini import (
+    BerniniRSamplingParams,
+    BerniniSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
@@ -779,6 +785,17 @@ def _register_configs():
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
         hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    )
+    register_configs(
+        sampling_param_cls=BerniniRSamplingParams,
+        pipeline_config_cls=BerniniRConfig,
+        hf_model_paths=["ByteDance/Bernini-R-Diffusers"],
+    )
+    register_configs(
+        sampling_param_cls=BerniniSamplingParams,
+        pipeline_config_cls=BerniniConfig,
+        hf_model_paths=["ByteDance/Bernini-Diffusers"],
+        model_detectors=[lambda model: model.lower() == "berninipipeline"],
     )
     register_configs(
         sampling_param_cls=LingBotWorldSamplingParams,

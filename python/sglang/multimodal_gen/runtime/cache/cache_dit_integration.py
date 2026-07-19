@@ -237,6 +237,7 @@ class DualTransformerBlockAdapterSpec:
     check_forward_pattern: bool
     check_num_outputs: bool
     has_separate_cfg: bool
+    num_cache_contexts: int = 1
 
 
 DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec] = {
@@ -247,6 +248,24 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
         check_forward_pattern=True,
         check_num_outputs=False,
         has_separate_cfg=True,
+    ),
+    "bernini-r": DualTransformerBlockAdapterSpec(
+        blocks_attr=("blocks", "blocks"),
+        blocks_name=None,
+        forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
+        check_forward_pattern=True,
+        check_num_outputs=False,
+        has_separate_cfg=False,
+        num_cache_contexts=4,
+    ),
+    "bernini": DualTransformerBlockAdapterSpec(
+        blocks_attr=("blocks", "blocks"),
+        blocks_name=None,
+        forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
+        check_forward_pattern=True,
+        check_num_outputs=False,
+        has_separate_cfg=False,
+        num_cache_contexts=5,
     ),
     "ideogram4": DualTransformerBlockAdapterSpec(
         blocks_attr=("layers", "layers"),
@@ -580,13 +599,49 @@ def enable_cache_on_dual_transformer(
             f"{transformer_2_blocks_attr}: {transformer_2_blocks is not None}"
         )
 
+    blocks = [transformer_blocks, transformer_2_blocks]
+    blocks_name = adapter_spec.blocks_name
+    forward_pattern = adapter_spec.forward_pattern
+    params_modifiers = [primary_modifier, secondary_modifier]
+
+    if adapter_spec.num_cache_contexts > 1:
+
+        def create_branch_blocks(transformer, transformer_blocks):
+            branch_blocks = []
+            branch_names = []
+            for branch in range(adapter_spec.num_cache_contexts):
+                name = f"_cache_dit_branch_blocks_{branch}"
+                blocks = torch.nn.ModuleList(transformer_blocks)
+                setattr(transformer, name, blocks)
+                branch_blocks.append(blocks)
+                branch_names.append(name)
+            transformer._cache_dit_branch_blocks = tuple(branch_names)
+            return branch_blocks, branch_names
+
+        transformer_blocks, transformer_blocks_names = create_branch_blocks(
+            transformer, transformer_blocks
+        )
+        transformer_2_blocks, transformer_2_blocks_names = create_branch_blocks(
+            transformer_2, transformer_2_blocks
+        )
+        blocks = [transformer_blocks, transformer_2_blocks]
+        blocks_name = [transformer_blocks_names, transformer_2_blocks_names]
+        forward_pattern = [
+            [pattern] * adapter_spec.num_cache_contexts
+            for pattern in adapter_spec.forward_pattern
+        ]
+        params_modifiers = [
+            [modifier] * adapter_spec.num_cache_contexts
+            for modifier in params_modifiers
+        ]
+
     cache_dit.enable_cache(
         BlockAdapter(
             transformer=[transformer, transformer_2],
-            blocks=[transformer_blocks, transformer_2_blocks],
-            blocks_name=adapter_spec.blocks_name,
-            forward_pattern=adapter_spec.forward_pattern,
-            params_modifiers=[primary_modifier, secondary_modifier],
+            blocks=blocks,
+            blocks_name=blocks_name,
+            forward_pattern=forward_pattern,
+            params_modifiers=params_modifiers,
             check_forward_pattern=adapter_spec.check_forward_pattern,
             check_num_outputs=adapter_spec.check_num_outputs,
             has_separate_cfg=adapter_spec.has_separate_cfg,

@@ -206,6 +206,9 @@ class Qwen2_5_VLAttention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
+        self.use_explicit_attention_mask = getattr(
+            config, "use_explicit_attention_mask", False
+        )
 
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
         self.attn = LocalAttention(
@@ -262,7 +265,12 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        attn_output = self.attn(query_states, key_states, value_states)
+        attn_output = self.attn(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask if self.use_explicit_attention_mask else None,
+        )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = _linear_output(self.o_proj, attn_output)

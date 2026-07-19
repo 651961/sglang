@@ -17,6 +17,12 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    gather_seq,
+    shard_like,
+    tail_attn_meta,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
@@ -43,6 +49,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
+    get_1d_rotary_pos_embed,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
     PatchEmbed,
@@ -67,6 +76,33 @@ _is_cuda = current_platform.is_cuda()
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
+
+
+def apply_source_id_rotary_emb(
+    freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    source_id: int | float,
+    *,
+    theta: float = 10000.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compose Bernini's scalar source RoPE with Wan's spatial-temporal RoPE."""
+    cos, sin = freqs_cis
+    source_pos = torch.tensor(
+        [float(source_id)], dtype=torch.float64, device=cos.device
+    )
+    source_cos, source_sin = get_1d_rotary_pos_embed(
+        cos.shape[-1] * 2,
+        source_pos,
+        theta=theta,
+        dtype=torch.float64,
+        device=cos.device,
+    )
+    source_cos = source_cos.to(dtype=cos.dtype)
+    source_sin = source_sin.to(dtype=sin.dtype)
+
+    return (
+        cos * source_cos - sin * source_sin,
+        sin * source_cos + cos * source_sin,
+    )
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -489,6 +525,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        self_attn_mask_meta: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -576,7 +613,12 @@ class WanTransformerBlock(nn.Module):
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
             ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output = self.attn1(query, key, value)
+        if self_attn_mask_meta is None:
+            attn_output = self.attn1(query, key, value)
+        else:
+            attn_output = self.attn1(
+                query, key, value, attn_mask_meta=self_attn_mask_meta
+            )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -968,7 +1010,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["blocks"]
 
-    @lru_cache(maxsize=1)
+    @lru_cache(maxsize=16)
     def _compute_rope_for_sequence_shard(
         self,
         local_len: int,
@@ -991,6 +1033,118 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
         return self.rotary_emb.forward_uncached(positions)
 
+    def patch_vae_latent(
+        self,
+        hidden_states: torch.Tensor,
+        source_id: int | float = 0,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Patch one Bernini latent segment and attach source-aware RoPE."""
+        _, _, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        grid_size = (num_frames // p_t, height // p_h, width // p_w)
+
+        # Each visual segment may be a single frame, so it cannot be sharded
+        # independently along time. Bernini concatenates all segments first and
+        # sequence-shards the resulting packed token stream in _forward_packed.
+        freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard(
+            math.prod(grid_size),
+            0,
+            grid_size[1] * grid_size[2],
+            grid_size[2],
+            hidden_states.device,
+        )
+        freqs_cis = apply_source_id_rotary_emb(
+            (freqs_cos.float(), freqs_sin.float()), source_id
+        )
+
+        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
+        return hidden_states, freqs_cis
+
+    def unpatchify(
+        self,
+        hidden_states: torch.Tensor,
+        output_shape: torch.Size | tuple[int, ...],
+    ) -> torch.Tensor:
+        """Restore projected Wan patch tokens to ``[B, C, T, H, W]``."""
+        batch_size, channels, num_frames, height, width = output_shape
+        p_t, p_h, p_w = self.patch_size
+        hidden_states = hidden_states.reshape(
+            batch_size,
+            num_frames // p_t,
+            height // p_h,
+            width // p_w,
+            p_t,
+            p_h,
+            p_w,
+            channels,
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+    def _forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        cache_branch: int | None = None,
+    ) -> torch.Tensor:
+        """Run the Wan backbone on Bernini's packed latent sequence."""
+        freqs_cos, freqs_sin = rotary_emb
+        orig_dtype = hidden_states.dtype
+
+        shard = build_shard_plan(hidden_states.shape[1])
+        self_attn_mask_meta = None
+        if shard.sp_size > 1:
+            hidden_states = shard_like(hidden_states, shard, dim=1)
+            freqs_cos = shard_like(freqs_cos, shard, dim=0, pad_mode="repeat_last")
+            freqs_sin = shard_like(freqs_sin, shard, dim=0, pad_mode="repeat_last")
+            self_attn_mask_meta = tail_attn_meta(
+                shard, hidden_states.shape[0], hidden_states.device
+            )
+
+        temb, timestep_proj, encoder_hidden_states, _ = self.condition_embedder(
+            timestep, encoder_hidden_states, None
+        )
+        timestep_proj = timestep_proj.unflatten(1, (6, -1))
+        encoder_hidden_states = (
+            encoder_hidden_states.to(orig_dtype)
+            if not current_platform.is_amp_supported()
+            else encoder_hidden_states
+        )
+        assert encoder_hidden_states.dtype == orig_dtype
+
+        freqs_cis = (freqs_cos.float(), freqs_sin.float())
+        blocks = self.blocks
+        branch_blocks = getattr(self, "_cache_dit_branch_blocks", ())
+        if cache_branch is not None and branch_blocks:
+            if not 0 <= cache_branch < len(branch_blocks):
+                raise ValueError(
+                    f"Cache-DiT branch {cache_branch} is outside the configured "
+                    f"range [0, {len(branch_blocks)})"
+                )
+            blocks = getattr(self, branch_blocks[cache_branch])
+
+        for block in blocks:
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                freqs_cis,
+                self_attn_mask_meta=self_attn_mask_meta,
+            )
+        self.cnt += 1
+
+        shift, scale = (
+            self.scale_shift_table.float() + temb.float().unsqueeze(1)
+        ).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states.float(), shift, scale).to(
+            orig_dtype
+        )
+        hidden_states, _ = self.proj_out(hidden_states)
+        return gather_seq(hidden_states, shard.orig_len, dim=1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -998,8 +1152,19 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         timestep: torch.LongTensor,
         encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None = None,
         guidance=None,
+        packed_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        packed_cache_branch: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        if packed_rotary_emb is not None:
+            return self._forward_packed(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                rotary_emb=packed_rotary_emb,
+                cache_branch=packed_cache_branch,
+            )
+
         forward_batch = get_forward_context().forward_batch
         if forward_batch is not None:
             sequence_shard_enabled = (
@@ -1185,20 +1350,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_states = self.norm_out(hidden_states, shift, scale)
         hidden_states, _ = self.proj_out(hidden_states)
 
-        hidden_states = hidden_states.reshape(
-            batch_size,
-            post_patch_num_frames,
-            post_patch_height,
-            post_patch_width,
-            p_t,
-            p_h,
-            p_w,
-            -1,
+        return self.unpatchify(
+            hidden_states,
+            (batch_size, self.out_channels, num_frames, height, width),
         )
-        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-
-        return output
 
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor

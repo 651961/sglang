@@ -50,6 +50,10 @@ def expand_path_fields(obj) -> None:
                 f.name,
                 {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
             )
+        elif f.name.endswith("_paths") and isinstance(v, str):
+            setattr(obj, f.name, eu(v))
+        elif f.name.endswith("_paths") and isinstance(v, list):
+            setattr(obj, f.name, [eu(x) if isinstance(x, str) else x for x in v])
 
 
 # TODO(will): used to convert server_args.precision to torch.dtype. Find a

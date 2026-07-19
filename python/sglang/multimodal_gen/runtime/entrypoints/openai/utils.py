@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
@@ -93,6 +94,86 @@ def flatten_extra_params(payload: Any) -> dict[str, Any]:
         payload.setdefault("use_guardrails", extra_params["guardrails"])
 
     return payload
+
+
+def get_sampling_params_cls(server_args) -> type[SamplingParams]:
+    """Resolve the active model's SamplingParams class."""
+    sampling_params_cls = SamplingParams
+    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+    if pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+    else:
+        try:
+            from sglang.multimodal_gen.registry import get_model_info
+
+            model_info = get_model_info(
+                server_args.model_path,
+                backend=server_args.backend,
+                model_id=server_args.model_id,
+            )
+            if model_info is not None:
+                sampling_params_cls = model_info.sampling_param_cls
+        except Exception as exc:
+            logger.debug("Falling back to base SamplingParams class: %s", exc)
+    return sampling_params_cls
+
+
+def get_sampling_params_field_names(server_args) -> frozenset[str]:
+    """Return request fields declared by the active model's SamplingParams."""
+    sampling_params_cls = get_sampling_params_cls(server_args)
+    return frozenset(field.name for field in dataclasses.fields(sampling_params_cls))
+
+
+def collect_model_sampling_params(
+    request, server_args, *, exclude: set[str] | frozenset[str] = frozenset()
+) -> dict[str, Any]:
+    """Collect model-specific fields accepted through Pydantic ``extra`` data."""
+    payload = dict(request.model_extra or {})
+    for container_name in ("extra_body", "extra_json", "extra_args", "extra_params"):
+        container = payload.pop(container_name, None)
+        if isinstance(container, str):
+            try:
+                container = json.loads(container)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(container, dict):
+            for name, value in flatten_extra_params(dict(container)).items():
+                payload.setdefault(name, value)
+    flatten_extra_params(payload)
+
+    declared_fields = set(request.__class__.model_fields)
+    supported_fields = get_sampling_params_field_names(server_args)
+    return {
+        name: value
+        for name, value in payload.items()
+        if name in supported_fields
+        and name not in declared_fields
+        and name not in exclude
+        and value is not None
+    }
+
+
+def collect_json_form_fields(form, field_names) -> dict[str, Any]:
+    """Collect selected form fields, decoding JSON scalars and repeated values."""
+    result = {}
+    for name in field_names:
+        values = form.getlist(name)
+        if not values:
+            continue
+        parsed_values = []
+        for value in values:
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+            parsed_values.append(value)
+        result[name] = parsed_values if len(parsed_values) > 1 else parsed_values[0]
+    return result
 
 
 @contextmanager

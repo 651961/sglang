@@ -968,6 +968,61 @@ class SamplingParams:
             type=float,
             help="Boundary timestep ratio",
         )
+
+        # Bernini renderer guidance and source-conditioning parameters. These
+        # flags live on the shared parser so ``sglang generate`` can discover
+        # them before the model-specific SamplingParams class is resolved.
+        # ``get_cli_args`` only retains fields declared by the resolved
+        # dataclass, so other model families do not receive these values.
+        for name, value_type, help_text in (
+            ("guidance_mode", str, "Guidance branch, for example rv2v or v2v_apg."),
+            ("omega_vid", float, "Video-conditioning guidance weight."),
+            ("omega_img", float, "Image-conditioning guidance weight."),
+            ("omega_txt", float, "Text-conditioning guidance weight."),
+            ("omega_tgt", float, "Target-visual-token guidance weight."),
+            ("omega_scale", float, "Low-noise expert guidance multiplier."),
+            ("eta", float, "Adaptive projected-guidance update weight."),
+            ("momentum", float, "Adaptive projected-guidance momentum."),
+            ("max_image_size", int, "Maximum source-media long-edge size."),
+            ("planning_step", int, "Bernini MLLM planning iterations."),
+            ("vit_denoising_step", int, "Bernini visual-token denoising steps."),
+            ("vit_txt_cfg", float, "Bernini planner text CFG weight."),
+            ("vit_img_cfg", float, "Bernini planner image CFG weight."),
+        ):
+            add_argument(
+                f"--{name.replace('_', '-')}",
+                type=value_type,
+                help=f"Bernini {help_text}",
+            )
+        add_argument(
+            "--norm-threshold",
+            type=float,
+            nargs="+",
+            help="Bernini APG norm threshold(s).",
+        )
+        add_argument(
+            "--reference-image-paths",
+            type=str,
+            nargs="+",
+            help="Additional Bernini reference image paths.",
+        )
+        add_argument(
+            "--task-type",
+            "--bernini-task-type",
+            dest="bernini_task_type",
+            type=str,
+            help="Bernini task type used to select the system instruction.",
+        )
+        add_argument(
+            "--system-prompt",
+            type=str,
+            help="Explicit Bernini system instruction.",
+        )
+        add_argument(
+            "--use-system-prompt",
+            action=StoreBoolean,
+            help="Enable or disable model-specific system-prompt prefixing.",
+        )
         add_argument(
             "--save-output",
             action="store_true",

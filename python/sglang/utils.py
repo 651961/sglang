@@ -32,6 +32,8 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
+    "bernini-r": "BerniniRendererPipeline",
+    "bernini_r": "BerniniRendererPipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "lerobot--pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",

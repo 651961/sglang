@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -805,20 +805,51 @@ class SenseNovaU1_5LanguageModel(nn.Module):
         self.model = SenseNovaU1_5Qwen3Model(config, quant_config)
 
 
-def _vision_rope(
-    x: torch.Tensor, positions: torch.Tensor, theta: float
-) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    x_part, y_part = x[..., :half], x[..., half:]
+def _build_vision_rope_cache(
+    grid_sizes: Sequence[tuple[int, int]],
+    embed_dim: int,
+    theta: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the fixed 2-D vision RoPE tables for one request.
 
-    def interleaved(part: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        dim = part.shape[-1]
-        inv = 1.0 / (
-            theta
-            ** (torch.arange(0, dim, 2, device=x.device, dtype=torch.float32) / dim)
+    The vision input geometry is constant throughout denoising.  Keeping the
+    tables in FP32 preserves the reference implementation's FP32 rotation
+    before its final cast back to the model dtype.
+    """
+    positions_x: list[torch.Tensor] = []
+    positions_y: list[torch.Tensor] = []
+    for height, width in grid_sizes:
+        y, x = torch.meshgrid(
+            torch.arange(height, device=device),
+            torch.arange(width, device=device),
+            indexing="ij",
         )
-        freq = torch.outer(pos.float(), inv)
-        cos, sin = freq.cos().to(x.dtype), freq.sin().to(x.dtype)
+        positions_x.append(x.reshape(-1))
+        positions_y.append(y.reshape(-1))
+
+    half = embed_dim // 2
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, half, 2, device=device, dtype=torch.float32) / half)
+    )
+
+    def sincos(positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        frequencies = torch.outer(positions.float(), inv_freq)
+        return frequencies.cos(), frequencies.sin()
+
+    return (*sincos(torch.cat(positions_x)), *sincos(torch.cat(positions_y)))
+
+
+def _apply_cached_vision_rope(
+    x: torch.Tensor,
+    rope_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    cos_x, sin_x, cos_y, sin_y = rope_cache
+    half = x.shape[-1] // 2
+
+    def interleaved(
+        part: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
         even, odd = part[..., 0::2], part[..., 1::2]
         out = torch.empty_like(part)
         out[..., 0::2] = even * cos - odd * sin
@@ -826,7 +857,11 @@ def _vision_rope(
         return out
 
     return torch.cat(
-        (interleaved(x_part, positions[0]), interleaved(y_part, positions[1])), -1
+        (
+            interleaved(x[..., :half], cos_x, sin_x),
+            interleaved(x[..., half:], cos_y, sin_y),
+        ),
+        dim=-1,
     )
 
 
@@ -851,31 +886,88 @@ class SenseNovaU1_5VisionEmbeddings(nn.Module):
         )
         self.gelu = nn.GELU()
 
+    def build_rope_cache(
+        self, grid_sizes: Sequence[tuple[int, int]], device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _build_vision_rope_cache(
+            grid_sizes, self.embed_dim, self.rope_theta, device
+        )
+
+    @staticmethod
+    def _normalize_grid_sizes(
+        grid_hw: torch.Tensor, grid_sizes: Sequence[tuple[int, int]] | None
+    ) -> tuple[tuple[int, int], ...]:
+        if grid_sizes is not None:
+            return tuple((int(height), int(width)) for height, width in grid_sizes)
+        # This fallback is used by one-time prefix encoding.  Generation
+        # passes Python geometry explicitly and never synchronizes here.
+        return tuple((int(height), int(width)) for height, width in grid_hw.tolist())
+
     def forward(
-        self, pixel_values: torch.Tensor, grid_hw: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        grid_hw: torch.Tensor,
+        *,
+        grid_sizes: Sequence[tuple[int, int]] | None = None,
+        rope_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
+        grid_sizes = self._normalize_grid_sizes(grid_hw, grid_sizes)
         pixels = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
         patches = self.gelu(self.patch_embedding(pixels)).view(-1, self.embed_dim)
-        positions = []
-        for height, width in grid_hw.tolist():
-            y, x = torch.meshgrid(
-                torch.arange(height, device=patches.device),
-                torch.arange(width, device=patches.device),
-                indexing="ij",
-            )
-            positions.append(torch.stack((x.reshape(-1), y.reshape(-1))))
-        patches = _vision_rope(
-            patches.float(), torch.cat(positions, dim=1), self.rope_theta
-        ).to(patches.dtype)
+        if rope_cache is None:
+            rope_cache = self.build_rope_cache(grid_sizes, patches.device)
+        patches = _apply_cached_vision_rope(patches.float(), rope_cache).to(
+            patches.dtype
+        )
         outputs = []
         offset = 0
-        for height, width in grid_hw.tolist():
+        for height, width in grid_sizes:
             count = height * width
             image = patches[offset : offset + count].view(1, height, width, -1)
             image = self.dense_embedding(image.permute(0, 3, 1, 2))
             outputs.append(image.permute(0, 2, 3, 1).reshape(-1, image.shape[1]))
             offset += count
         return torch.cat(outputs, dim=0)
+
+    def forward_bchw(
+        self,
+        images: torch.Tensor,
+        grid_sizes: Sequence[tuple[int, int]],
+        rope_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
+    ) -> torch.Tensor:
+        """Generation fast path that keeps the image in BCHW layout.
+
+        The generation image has one fixed grid for every batch item, so the
+        patch convolution can consume the image directly.  Editing prefixes
+        may contain heterogeneous grids and continue to use ``forward``.
+        """
+        if len(grid_sizes) != images.shape[0]:
+            raise ValueError(
+                "grid_sizes must contain one entry per BCHW image, got "
+                f"{len(grid_sizes)} for batch {images.shape[0]}"
+            )
+        expected = (
+            images.shape[2] // self.patch_size,
+            images.shape[3] // self.patch_size,
+        )
+        if any(tuple(size) != expected for size in grid_sizes):
+            raise ValueError(
+                "forward_bchw requires one common patch grid for all images"
+            )
+
+        patches = self.gelu(self.patch_embedding(images))
+        patches = patches.permute(0, 2, 3, 1).reshape(-1, self.embed_dim)
+        if rope_cache is None:
+            rope_cache = self.build_rope_cache(grid_sizes, patches.device)
+        patches = _apply_cached_vision_rope(patches.float(), rope_cache).to(
+            patches.dtype
+        )
+        height, width = expected
+        patches = patches.view(images.shape[0], height, width, self.embed_dim)
+        image = self.dense_embedding(patches.permute(0, 3, 1, 2))
+        return image.permute(0, 2, 3, 1).reshape(-1, image.shape[1])
 
 
 class SenseNovaU1_5VisionModel(nn.Module):
@@ -884,15 +976,42 @@ class SenseNovaU1_5VisionModel(nn.Module):
         self.embeddings = SenseNovaU1_5VisionEmbeddings(config)
 
     def forward(
-        self, pixel_values: torch.Tensor, grid_hw: torch.Tensor
+        self,
+        pixel_values: torch.Tensor,
+        grid_hw: torch.Tensor,
+        *,
+        grid_sizes: Sequence[tuple[int, int]] | None = None,
+        rope_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> torch.Tensor:
-        return self.embeddings(pixel_values, grid_hw)
+        return self.embeddings(
+            pixel_values, grid_hw, grid_sizes=grid_sizes, rope_cache=rope_cache
+        )
+
+    def forward_bchw(
+        self,
+        images: torch.Tensor,
+        grid_sizes: Sequence[tuple[int, int]],
+        rope_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
+    ) -> torch.Tensor:
+        return self.embeddings.forward_bchw(images, grid_sizes, rope_cache)
+
+    def build_rope_cache(
+        self, grid_sizes: Sequence[tuple[int, int]], device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.embeddings.build_rope_cache(grid_sizes, device)
 
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
+        # The model is constructed on ``meta`` during checkpoint loading.
+        # A concrete non-checkpoint buffer created here would remain on meta
+        # and fail the loader's post-load validation, so materialize this
+        # deterministic cache lazily on the first real forward instead.
+        self.register_buffer("_frequency_cache", None, persistent=False)
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size),
             nn.SiLU(),
@@ -900,12 +1019,15 @@ class TimestepEmbedder(nn.Module):
         )
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        half = self.frequency_embedding_size // 2
-        freqs = torch.exp(
-            -math.log(10000.0)
-            * torch.arange(half, device=timestep.device, dtype=torch.float32)
-            / half
-        )
+        freqs = self._frequency_cache
+        if freqs is None or freqs.device != timestep.device:
+            half = self.frequency_embedding_size // 2
+            freqs = torch.exp(
+                -math.log(10000.0)
+                * torch.arange(half, device=timestep.device, dtype=torch.float32)
+                / half
+            )
+            self._frequency_cache = freqs
         args = timestep[:, None].float() * freqs[None]
         embedding = torch.cat((args.cos(), args.sin()), dim=-1)
         return self.mlp(embedding.to(self.mlp[0].weight.dtype))
@@ -1172,16 +1294,42 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                 tuple[tuple[torch.Tensor, torch.Tensor], ...],
             ]
         ],
-        z: torch.Tensor,
+        z: torch.Tensor | None,
         timestep: torch.Tensor,
         image_size: tuple[int, int],
+        *,
+        image_bchw: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         branch_count = len(branches)
+        model_inputs = (
+            image_embeds
+            if branch_count == 1
+            else image_embeds.repeat(branch_count, 1, 1)
+        )
         hidden = self.language_model.model.forward_generation_branches(
-            image_embeds.repeat(branch_count, 1, 1),
+            model_inputs,
             [branch[1] for branch in branches],
             [branch[2] for branch in branches],
         )
+        if image_bchw is not None:
+            batch = image_bchw.shape[0]
+            merge = int(1 / self.downsample_ratio)
+            token_h = image_size[1] // (self.patch_size * merge)
+            token_w = image_size[0] // (self.patch_size * merge)
+            image_2d = hidden.view(branch_count * batch, token_h, token_w, -1).permute(
+                0, 3, 1, 2
+            )
+            decoded = self.fm_modules["fm_head"](image_2d)
+            velocity = (
+                decoded.view(
+                    branch_count, batch, 3, image_bchw.shape[2], image_bchw.shape[3]
+                )
+                - image_bchw.unsqueeze(0)
+            ) / (1 - timestep).clamp_min(self.t_eps)
+            return list(velocity.unbind(0))
+
+        if z is None:
+            raise ValueError("z is required for the patch-token velocity path")
         batch, length = z.shape[:2]
         merge = int(1 / self.downsample_ratio)
         token_h = image_size[1] // (self.patch_size * merge)
@@ -1201,9 +1349,8 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         predicted = decoded.permute(0, 2, 4, 3, 5, 1).reshape(
             branch_count * batch, length, (self.patch_size * merge) ** 2 * 3
         )
-        velocity = (predicted - z.repeat(branch_count, 1, 1)) / (
-            1 - timestep
-        ).clamp_min(self.t_eps)
+        z_inputs = z if branch_count == 1 else z.repeat(branch_count, 1, 1)
+        velocity = (predicted - z_inputs) / (1 - timestep).clamp_min(self.t_eps)
         return list(velocity.view(branch_count, batch, length, -1).unbind(0))
 
     def _initial_noise(
@@ -1254,7 +1401,9 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
     ) -> torch.Tensor:
         image, noise_scale, grid_hw = self._initial_noise(batch_size, image_size, seed)
         merge = int(1 / self.downsample_ratio)
-        token_h, token_w = int(grid_hw[0, 0]) // merge, int(grid_hw[0, 1]) // merge
+        grid_h = image_size[1] // self.patch_size
+        grid_w = image_size[0] // self.patch_size
+        token_h, token_w = grid_h // merge, grid_w // merge
         generation_length = token_h * token_w
         condition_cache = self.language_model.model.prepare_generation_cache(
             condition_cache,
@@ -1276,7 +1425,9 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         timesteps = self._shift_timesteps(
             torch.linspace(0, 1, num_steps + 1, device=self.device), timestep_shift
         )
-        noise_scale_embedding = None
+        timestep_embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1]).view(
+            num_steps, 1, 1, -1
+        )
         if self.add_noise_scale_embedding:
             noise_scale_embedding = self.fm_modules["noise_scale_embedder"](
                 torch.tensor(
@@ -1285,6 +1436,13 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                     dtype=torch.float32,
                 )
             ).view(1, 1, -1)
+            timestep_embeddings = timestep_embeddings + noise_scale_embedding
+
+        vision_grid_sizes = ((grid_h, grid_w),) * batch_size
+        vision_rope_cache = self.fm_modules["vision_model_mot_gen"].build_rope_cache(
+            vision_grid_sizes, self.device
+        )
+        use_bchw = cfg_norm == "none"
         rope_caches = {}
         for indexes in (condition_indexes, img_condition_indexes, uncondition_indexes):
             if indexes is not None and id(indexes) not in rope_caches:
@@ -1293,20 +1451,22 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                 )
         for step in range(num_steps):
             timestep, next_timestep = timesteps[step], timesteps[step + 1]
-            z = self._patchify(image, self.patch_size * merge)
-            image_input = self._patchify(image, self.patch_size, channel_first=True)
-            embeds = self.fm_modules["vision_model_mot_gen"](
-                image_input.view(
-                    batch_size * int(grid_hw[0, 0]) * int(grid_hw[0, 1]), -1
-                ),
-                grid_hw,
-            ).view(batch_size, token_h * token_w, -1)
-            time_embed = self.fm_modules["timestep_embedder"](timestep.reshape(1)).view(
-                1, 1, -1
-            )
-            if noise_scale_embedding is not None:
-                time_embed = time_embed + noise_scale_embedding
-            embeds = embeds + time_embed
+            z = None if use_bchw else self._patchify(image, self.patch_size * merge)
+            if use_bchw:
+                embeds = (
+                    self.fm_modules["vision_model_mot_gen"]
+                    .forward_bchw(image, vision_grid_sizes, vision_rope_cache)
+                    .view(batch_size, token_h * token_w, -1)
+                )
+            else:
+                image_input = self._patchify(image, self.patch_size, channel_first=True)
+                embeds = self.fm_modules["vision_model_mot_gen"](
+                    image_input.view(batch_size * grid_h * grid_w, -1),
+                    grid_hw,
+                    grid_sizes=vision_grid_sizes,
+                    rope_cache=vision_rope_cache,
+                ).view(batch_size, token_h * token_w, -1)
+            embeds = embeds + timestep_embeddings[step]
             branches = [(condition_indexes, condition_cache)]
             if uncondition_cache is None and img_condition_cache is None:
                 branch_names = ("condition",)
@@ -1341,6 +1501,7 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                 z,
                 timestep,
                 image_size,
+                image_bchw=image if use_bchw else None,
             )
             condition = branch_outputs[0]
             if branch_names == ("condition",):
@@ -1368,12 +1529,15 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                     / (torch.norm(velocity, dim=-1, keepdim=True) + 1e-8)
                 ).clamp(max=1)
                 velocity = velocity * scale
-            image = self._unpatchify(
-                z + (next_timestep - timestep) * velocity,
-                self.patch_size * merge,
-                image_size[1],
-                image_size[0],
-            )
+            if use_bchw:
+                image = image + (next_timestep - timestep) * velocity
+            else:
+                image = self._unpatchify(
+                    z + (next_timestep - timestep) * velocity,
+                    self.patch_size * merge,
+                    image_size[1],
+                    image_size[0],
+                )
         return image
 
     @torch.inference_mode()

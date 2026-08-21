@@ -398,6 +398,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
+    "can_use_fused_sensenova_u1_5_qknorm_rope_kv": "rope.sensenova_u1_5_qknorm_rope_jit",
+    "fused_sensenova_u1_5_qknorm_rope_kv": "rope.sensenova_u1_5_qknorm_rope_jit",
     "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
     "apply_rotary_embedding": "rope.rotary_triton",

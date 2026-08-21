@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,10 +16,13 @@ import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image
 
+from sglang.kernels.ops.activation.activation import (
+    silu_and_mul_with_activation_rounding,
+)
 from sglang.kernels.ops.diffusion import (
-    can_use_fused_silu_mul,
     can_use_fused_rope_rotate_half,
-    fused_silu_mul_bitexact,
+    can_use_fused_sensenova_u1_5_qknorm_rope_kv,
+    fused_sensenova_u1_5_qknorm_rope_kv,
     fused_rope_rotate_half_bitexact,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
@@ -32,12 +36,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
-)
-from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import (
-    Qwen3VLRowParallelLinear,
-    _gather_tensor_parallel_activation,
-    _make_text_row_linear,
-    _tp_world_size,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.layers.layernorm import RMSNorm
@@ -138,37 +136,64 @@ def _apply_axis_rope(
     if cos.dtype != q.dtype:
         cos, sin = cos.to(q.dtype), sin.to(q.dtype)
     if q.dtype is torch.bfloat16 and q.is_cuda:
+        # Spatial H/W slices are strided views. Materializing them lets all
+        # three axes use the fused kernel instead of silently falling back.
+        fused_q = q.contiguous()
+        fused_k = k.contiguous()
         batch = q.shape[0]
         cos_rows = cos.expand(batch, -1, -1).reshape(-1, cos.shape[-1])
         sin_rows = sin.expand(batch, -1, -1).reshape(-1, sin.shape[-1])
-        can_fuse = can_use_fused_rope_rotate_half(q, cos_rows, sin_rows)
+        can_fuse = can_use_fused_rope_rotate_half(fused_q, cos_rows, sin_rows)
         can_fuse = can_fuse and can_use_fused_rope_rotate_half(
-            k, cos_rows, sin_rows
+            fused_k, cos_rows, sin_rows
         )
         if can_fuse:
             return (
-                fused_rope_rotate_half_bitexact(q, cos_rows, sin_rows),
-                fused_rope_rotate_half_bitexact(k, cos_rows, sin_rows),
+                fused_rope_rotate_half_bitexact(fused_q, cos_rows, sin_rows),
+                fused_rope_rotate_half_bitexact(fused_k, cos_rows, sin_rows),
             )
     cos = cos[None, :, None]
     sin = sin[None, :, None]
     return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
 
-def _block_causal_mask(block_index: torch.Tensor) -> torch.Tensor:
-    """Build the official U1.5 ``same_block | causal`` prefix mask."""
-    length = block_index.numel()
-    row_blocks = block_index[:, None].expand(length, length)
-    col_blocks = block_index[None, :].expand(length, length)
-    positions = torch.arange(length, device=block_index.device)
-    allowed = (col_blocks == row_blocks) | (
-        positions[None, :] <= positions[:, None]
-    )
-    return torch.where(
-        allowed[None, None],
-        torch.zeros((), device=block_index.device),
-        torch.full((), float("-inf"), device=block_index.device),
-    )
+@dataclass
+class SenseNovaU1_5KVCache:
+    """Preallocated FlashAttention KV storage for one decoder layer."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+    prefix_length: int
+
+
+def _prefix_attention_runs(block_index: torch.Tensor) -> list[tuple[int, int, bool]]:
+    """Split ``same-block | causal`` attention into mask-free FA calls.
+
+    Runs of singleton (text) blocks are causal. Multi-token image blocks are
+    bidirectional, while their K/V include all preceding runs.
+    """
+    values = block_index.tolist()
+    runs: list[tuple[int, int, bool]] = []
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and values[end] == values[start]:
+            end += 1
+        if end - start > 1:
+            runs.append((start, end, False))
+            start = end
+            continue
+        end = start + 1
+        while end < len(values):
+            next_end = end + 1
+            while next_end < len(values) and values[next_end] == values[end]:
+                next_end += 1
+            if next_end - end > 1:
+                break
+            end = next_end
+        runs.append((start, end, True))
+        start = end
+    return runs
 
 
 class SenseNovaU1_5Attention(nn.Module):
@@ -182,15 +207,8 @@ class SenseNovaU1_5Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.head_dim = int(config.head_dim)
-        tp_size = _tp_world_size()
-        use_tp = (
-            tp_size > 1
-            and config.num_attention_heads % tp_size == 0
-            and config.num_key_value_heads % tp_size == 0
-        )
-        self.tp_size = tp_size if use_tp else 1
-        self.num_heads = config.num_attention_heads // self.tp_size
-        self.num_kv_heads = config.num_key_value_heads // self.tp_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
 
         q_out = config.num_attention_heads * self.head_dim
@@ -201,9 +219,7 @@ class SenseNovaU1_5Attention(nn.Module):
             total_num_kv_heads=config.num_key_value_heads,
             bias=bool(config.attention_bias),
             quant_config=quant_config,
-            prefix=(
-                f"language_model.model.layers.{layer_idx}.self_attn.qkv_proj"
-            ),
+            prefix=(f"language_model.model.layers.{layer_idx}.self_attn.qkv_proj"),
         )
         self.qkv_proj_mot_gen = QKVParallelLinear(
             hidden_size=config.hidden_size,
@@ -217,26 +233,13 @@ class SenseNovaU1_5Attention(nn.Module):
             ),
         )
 
-        def row(suffix: str):
-            if quant_config is not None:
-                return _make_sensenova_linear(
-                    q_out,
-                    config.hidden_size,
-                    bias=bool(config.attention_bias),
-                    quant_config=quant_config,
-                    prefix=(
-                        f"language_model.model.layers.{layer_idx}."
-                        f"self_attn.{suffix}"
-                    ),
-                )
-            return _make_text_row_linear(
+        def row(suffix: str) -> nn.Module:
+            return _make_sensenova_linear(
                 q_out,
                 config.hidden_size,
                 bias=bool(config.attention_bias),
-                quant_config=None,
-                use_weight_only_fp8=False,
-                use_tensor_parallel=use_tp,
-                prefix=f"layers.{layer_idx}.self_attn.{suffix}",
+                quant_config=quant_config,
+                prefix=f"language_model.model.layers.{layer_idx}.self_attn.{suffix}",
             )
 
         self.o_proj = row("o_proj")
@@ -266,6 +269,14 @@ class SenseNovaU1_5Attention(nn.Module):
             causal=True,
             supported_attention_backends=supported,
         )
+        self.prefix_block_attention = LocalAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.scaling,
+            causal=False,
+            supported_attention_backends=supported,
+        )
         self.generation_attention = LocalAttention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -278,7 +289,6 @@ class SenseNovaU1_5Attention(nn.Module):
     def _qkv(
         self,
         hidden_states: torch.Tensor,
-        indexes: torch.Tensor,
         generation: bool,
         rope_cache: tuple[
             tuple[torch.Tensor, torch.Tensor],
@@ -286,40 +296,131 @@ class SenseNovaU1_5Attention(nn.Module):
             tuple[torch.Tensor, torch.Tensor],
         ],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, k, v = self._project_qkv(hidden_states, generation)
+        q, k = self._apply_qk_rope(q, k, generation, rope_cache)
+        return q, k, v
+
+    def _apply_qk_rope(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        generation: bool,
+        rope_cache: tuple[
+            tuple[torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor],
+        ],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q_norm, k_norm, q_norm_hw, k_norm_hw = self._norms(generation)
+        q_t, q_hw = q.chunk(2, dim=-1)
+        k_t, k_hw = k.chunk(2, dim=-1)
+        q_t, k_t = self._norm_rope(q_t, k_t, q_norm, k_norm, rope_cache[0])
+        q_hw, k_hw = self._norm_rope(
+            q_hw, k_hw, q_norm_hw, k_norm_hw, rope_cache[1], rope_dim=32
+        )
+        q_h, q_w = q_hw.split(self.head_dim // 4, dim=-1)
+        k_h, k_w = k_hw.split(self.head_dim // 4, dim=-1)
+        q_w, k_w = _apply_axis_rope(q_w, k_w, rope_cache[2])
+        q[..., : self.head_dim // 2] = q_t
+        k[..., : self.head_dim // 2] = k_t
+        q[..., self.head_dim // 2 :] = torch.cat((q_h, q_w), dim=-1)
+        k[..., self.head_dim // 2 :] = torch.cat((k_h, k_w), dim=-1)
+        return q, k
+
+    def _fused_generation_qk_rope_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_slot: torch.Tensor,
+        value_slot: torch.Tensor,
+        rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ) -> bool:
+        q_norm, k_norm, q_norm_hw, k_norm_hw = self._norms(True)
+        weights = (q_norm.weight, k_norm.weight, q_norm_hw.weight, k_norm_hw.weight)
+        caches = tuple(tensor for axis in rope_cache for tensor in axis)
+        expected_shapes = ((q.shape[1], 64),) * 2 + ((q.shape[1], 32),) * 4
+        if not (
+            self.head_dim == 128
+            and q.dtype is torch.bfloat16
+            and all(
+                tensor.is_cuda and tensor.dtype is q.dtype
+                for tensor in (q, k, v, key_slot, value_slot, *weights, *caches)
+            )
+            and all(tensor.is_contiguous() for tensor in caches)
+            and all(
+                tensor.shape == shape for tensor, shape in zip(caches, expected_shapes)
+            )
+            and q_norm.variance_epsilon == q_norm_hw.variance_epsilon
+            and k_norm.variance_epsilon == q_norm.variance_epsilon
+            and k_norm_hw.variance_epsilon == q_norm.variance_epsilon
+            and can_use_fused_sensenova_u1_5_qknorm_rope_kv(q.dtype, q.device)
+        ):
+            return False
+        fused_sensenova_u1_5_qknorm_rope_kv(
+            q,
+            k,
+            v,
+            key_slot,
+            value_slot,
+            *weights,
+            *caches,
+            q_norm.variance_epsilon,
+        )
+        return True
+
+    def _norms(self, generation: bool):
+        if generation:
+            return (
+                self.q_norm_mot_gen,
+                self.k_norm_mot_gen,
+                self.q_norm_hw_mot_gen,
+                self.k_norm_hw_mot_gen,
+            )
+        return self.q_norm, self.k_norm, self.q_norm_hw, self.k_norm_hw
+
+    @staticmethod
+    def _norm_rope(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        q_norm: RMSNorm,
+        k_norm: RMSNorm,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
+        *,
+        rope_dim: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        head_dim = q.shape[-1]
+        rope_dim = head_dim if rope_dim is None else rope_dim
+        q, k = q_norm(q), k_norm(k)
+        if rope_dim < head_dim:
+            q_head, q_tail = q.split(rope_dim, dim=-1)
+            k_head, k_tail = k.split(rope_dim, dim=-1)
+            q_head, k_head = _apply_axis_rope(q_head, k_head, rope_cache)
+            return torch.cat((q_head, q_tail), -1), torch.cat((k_head, k_tail), -1)
+        return _apply_axis_rope(q, k, rope_cache)
+
+    def _project_qkv(
+        self, hidden_states: torch.Tensor, generation: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if generation:
             q_proj = self.qkv_proj_mot_gen
-            q_norm, k_norm = self.q_norm_mot_gen, self.k_norm_mot_gen
-            q_norm_hw, k_norm_hw = self.q_norm_hw_mot_gen, self.k_norm_hw_mot_gen
         else:
             q_proj = self.qkv_proj
-            q_norm, k_norm = self.q_norm, self.k_norm
-            q_norm_hw, k_norm_hw = self.q_norm_hw, self.k_norm_hw
 
         batch, seq_len, _ = hidden_states.shape
         qkv = _linear_output(q_proj, hidden_states)
         q, k, v = qkv.split(
-            [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim,
-             self.num_kv_heads * self.head_dim],
+            [
+                self.num_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+            ],
             dim=-1,
         )
         q = q.view(batch, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim)
 
-        q_t, q_hw = q.chunk(2, dim=-1)
-        k_t, k_hw = k.chunk(2, dim=-1)
-        q_t = q_norm(q_t)
-        k_t = k_norm(k_t)
-        q_hw = q_norm_hw(q_hw)
-        k_hw = k_norm_hw(k_hw)
-        q_h, q_w = q_hw.chunk(2, dim=-1)
-        k_h, k_w = k_hw.chunk(2, dim=-1)
-
-        q_t, k_t = _apply_axis_rope(q_t, k_t, rope_cache[0])
-        q_h, k_h = _apply_axis_rope(q_h, k_h, rope_cache[1])
-        q_w, k_w = _apply_axis_rope(q_w, k_w, rope_cache[2])
-        q = torch.cat((q_t, q_h, q_w), dim=-1).contiguous()
-        k = torch.cat((k_t, k_h, k_w), dim=-1).contiguous()
         return q, k, v
 
     def _output_projection(
@@ -327,40 +428,84 @@ class SenseNovaU1_5Attention(nn.Module):
     ) -> torch.Tensor:
         output = output.reshape(*output.shape[:2], -1).contiguous()
         projection = self.o_proj_mot_gen if generation else self.o_proj
-        if not isinstance(projection, Qwen3VLRowParallelLinear):
-            output = _gather_tensor_parallel_activation(output, projection)
         return _linear_output(projection, output)
 
     def forward_prefix(
         self,
         hidden_states: torch.Tensor,
-        indexes: torch.Tensor,
-        attn_mask: torch.Tensor,
+        attention_runs: list[tuple[int, int, bool]],
         rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        q, k, v = self._qkv(hidden_states, indexes, generation=False, rope_cache=rope_cache)
-        output = self.prefix_attention(q, k, v, attn_mask=attn_mask)
-        return self._output_projection(output, generation=False), (
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-        )
+        q, k, v = self._qkv(hidden_states, generation=False, rope_cache=rope_cache)
+        outputs = []
+        for start, end, causal in attention_runs:
+            attention = self.prefix_attention if causal else self.prefix_block_attention
+            outputs.append(attention(q[:, start:end], k[:, :end], v[:, :end]))
+        output = torch.cat(outputs, dim=1)
+        return self._output_projection(output, generation=False), (k, v)
 
     def forward_generation(
         self,
         hidden_states: torch.Tensor,
-        indexes: torch.Tensor,
-        prefix_cache: tuple[torch.Tensor, torch.Tensor],
+        prefix_cache: SenseNovaU1_5KVCache,
         rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
     ) -> torch.Tensor:
-        q, k, v = self._qkv(hidden_states, indexes, generation=True, rope_cache=rope_cache)
-        prefix_k, prefix_v = prefix_cache
-        batch = hidden_states.shape[0]
-        prefix_k = prefix_k.expand(batch, -1, -1, -1)
-        prefix_v = prefix_v.expand(batch, -1, -1, -1)
-        k = torch.cat((prefix_k.transpose(1, 2), k), dim=1)
-        v = torch.cat((prefix_v.transpose(1, 2), v), dim=1)
-        output = self.generation_attention(q, k, v)
+        q, k, v = self._project_qkv(hidden_states, generation=True)
+        end = prefix_cache.prefix_length + k.shape[1]
+        key_slot = prefix_cache.key[:, prefix_cache.prefix_length : end]
+        value_slot = prefix_cache.value[:, prefix_cache.prefix_length : end]
+        fused = self._fused_generation_qk_rope_kv(
+            q, k, v, key_slot, value_slot, rope_cache
+        )
+        if not fused:
+            q, k = self._apply_qk_rope(q, k, True, rope_cache)
+            key_slot.copy_(k)
+            value_slot.copy_(v)
+        output = self.generation_attention(
+            q, prefix_cache.key[:, :end], prefix_cache.value[:, :end]
+        )
         return self._output_projection(output, generation=True)
+
+    def forward_generation_branches(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_caches: list[SenseNovaU1_5KVCache],
+        rope_caches: list[tuple[tuple[torch.Tensor, torch.Tensor], ...]],
+    ) -> torch.Tensor:
+        """Run all CFG branches through shared projection GEMMs."""
+        branch_count = len(prefix_caches)
+        q, k, v = self._project_qkv(hidden_states, generation=True)
+        outputs = []
+        for q_branch, k_branch, v_branch, cache, rope_cache in zip(
+            q.chunk(branch_count),
+            k.chunk(branch_count),
+            v.chunk(branch_count),
+            prefix_caches,
+            rope_caches,
+        ):
+            end = cache.prefix_length + k_branch.shape[1]
+            key_slot = cache.key[:, cache.prefix_length : end]
+            value_slot = cache.value[:, cache.prefix_length : end]
+            fused = self._fused_generation_qk_rope_kv(
+                q_branch,
+                k_branch,
+                v_branch,
+                key_slot,
+                value_slot,
+                rope_cache,
+            )
+            if not fused:
+                q_branch, k_branch = self._apply_qk_rope(
+                    q_branch, k_branch, True, rope_cache
+                )
+                key_slot.copy_(k_branch)
+                value_slot.copy_(v_branch)
+            outputs.append(
+                self.generation_attention(
+                    q_branch, cache.key[:, :end], cache.value[:, :end]
+                )
+            )
+        return self._output_projection(torch.cat(outputs), generation=True)
 
 
 class SenseNovaU1_5MLP(nn.Module):
@@ -388,10 +533,17 @@ class SenseNovaU1_5MLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = _linear_output(self.gate_up_proj, hidden_states)
-        gate, up = gate_up.chunk(2, dim=-1)
-        if can_use_fused_silu_mul(gate, up):
-            hidden_states = fused_silu_mul_bitexact(gate, up)
+        if (
+            gate_up.is_cuda
+            and gate_up.dtype in (torch.float16, torch.bfloat16)
+            and gate_up.is_contiguous()
+            and gate_up.shape[-1] % 32 == 0
+            and gate_up.numel() > 0
+        ):
+            # Preserve the eager low-precision activation rounding.
+            hidden_states = silu_and_mul_with_activation_rounding(gate_up)
         else:
+            gate, up = gate_up.chunk(2, dim=-1)
             hidden_states = torch.nn.functional.silu(gate) * up
         return _linear_output(self.down_proj, hidden_states)
 
@@ -406,9 +558,7 @@ class SenseNovaU1_5DecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = SenseNovaU1_5Attention(config, layer_idx, quant_config)
         prefix = f"language_model.model.layers.{layer_idx}"
-        self.mlp = SenseNovaU1_5MLP(
-            config, quant_config, prefix=f"{prefix}.mlp"
-        )
+        self.mlp = SenseNovaU1_5MLP(config, quant_config, prefix=f"{prefix}.mlp")
         self.mlp_mot_gen = SenseNovaU1_5MLP(
             config, quant_config, prefix=f"{prefix}.mlp_mot_gen"
         )
@@ -428,54 +578,92 @@ class SenseNovaU1_5DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        indexes: torch.Tensor,
         *,
         rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
         generation: bool,
-        attn_mask: torch.Tensor | None = None,
-        prefix_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]] | torch.Tensor:
+        attention_runs: list[tuple[int, int, bool]] | None = None,
+        prefix_cache: SenseNovaU1_5KVCache | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor]
+    ):
         if generation:
             if prefix_cache is None:
                 raise ValueError("generation requires prefix_cache")
             return self.forward_generation(
-                hidden_states, indexes, prefix_cache, rope_cache
+                hidden_states, prefix_cache, rope_cache, residual
             )
-        if attn_mask is None:
-            raise ValueError("prefix requires attn_mask")
-        return self.forward_prefix(hidden_states, indexes, attn_mask, rope_cache)
+        if attention_runs is None:
+            raise ValueError("prefix requires attention runs")
+        return self.forward_prefix(hidden_states, attention_runs, rope_cache, residual)
 
     def forward_prefix(
         self,
         hidden_states: torch.Tensor,
-        indexes: torch.Tensor,
-        attn_mask: torch.Tensor,
+        attention_runs: list[tuple[int, int, bool]],
         rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        residual = hidden_states
+        residual: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        # Carry the residual across layers so RMSNorm can fuse the add with
+        # normalization.  The representation is equivalent to the explicit
+        # ``residual + attention`` / ``residual + mlp`` formulation.
+        if residual is None:
+            residual = hidden_states
+            normalized = self.input_layernorm(hidden_states)
+        else:
+            normalized, residual = self.input_layernorm(hidden_states, residual)
         attention, cache = self.self_attn.forward_prefix(
-            self.input_layernorm(hidden_states), indexes, attn_mask, rope_cache
+            normalized, attention_runs, rope_cache
         )
-        hidden_states = residual + attention
-        return hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)
-        ), cache
+        normalized, residual = self.post_attention_layernorm(attention, residual)
+        return self.mlp(normalized), residual, cache
 
     def forward_generation(
         self,
         hidden_states: torch.Tensor,
-        indexes: torch.Tensor,
-        prefix_cache: tuple[torch.Tensor, torch.Tensor],
+        prefix_cache: SenseNovaU1_5KVCache,
         rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
-    ) -> torch.Tensor:
-        residual = hidden_states
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            normalized = self.input_layernorm_mot_gen(hidden_states)
+        else:
+            normalized, residual = self.input_layernorm_mot_gen(hidden_states, residual)
         attention = self.self_attn.forward_generation(
-            self.input_layernorm_mot_gen(hidden_states), indexes, prefix_cache, rope_cache
+            normalized, prefix_cache, rope_cache
         )
-        hidden_states = residual + attention
-        return hidden_states + self.mlp_mot_gen(
-            self.post_attention_layernorm_mot_gen(hidden_states)
+        normalized, residual = self.post_attention_layernorm_mot_gen(
+            attention, residual
         )
+        return self.mlp_mot_gen(normalized), residual
+
+    def forward_generation_branches(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_caches: list[SenseNovaU1_5KVCache],
+        rope_caches: list[tuple[tuple[torch.Tensor, torch.Tensor], ...]],
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            normalized = self.input_layernorm_mot_gen(hidden_states)
+        else:
+            normalized, residual = self.input_layernorm_mot_gen(hidden_states, residual)
+        attention = self.self_attn.forward_generation_branches(
+            normalized,
+            prefix_caches,
+            rope_caches,
+        )
+        normalized, residual = self.post_attention_layernorm_mot_gen(
+            attention, residual
+        )
+        return self.mlp_mot_gen(normalized), residual
 
 
 class SenseNovaU1_5Qwen3Model(nn.Module):
@@ -521,45 +709,90 @@ class SenseNovaU1_5Qwen3Model(nn.Module):
         indexes: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
         hidden_states = (
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
         rope_cache = self.build_rope_cache(indexes, hidden_states.dtype)
-        attn_mask = _block_causal_mask(indexes[0])
+        attention_runs = _prefix_attention_runs(indexes[0])
         cache = []
+        residual = None
         for layer in self.layers:
-            hidden_states, layer_cache = layer(
+            hidden_states, residual, layer_cache = layer(
                 hidden_states,
-                indexes,
-                attn_mask=attn_mask,
                 rope_cache=rope_cache,
                 generation=False,
+                attention_runs=attention_runs,
+                residual=residual,
             )
             cache.append(layer_cache)
-        return cache, self.norm(hidden_states)
+        return cache
 
     def forward_generation(
         self,
         inputs_embeds: torch.Tensor,
         indexes: torch.Tensor,
-        prefix_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        prefix_cache: list[SenseNovaU1_5KVCache],
         rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
         if rope_cache is None:
             rope_cache = self.build_rope_cache(indexes, hidden_states.dtype)
+        residual = None
         for layer, layer_cache in zip(self.layers, prefix_cache):
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states,
-                indexes,
                 prefix_cache=layer_cache,
                 rope_cache=rope_cache,
                 generation=True,
+                residual=residual,
             )
-        return self.norm_mot_gen(hidden_states)
+        normalized, _ = self.norm_mot_gen(hidden_states, residual)
+        return normalized
+
+    def forward_generation_branches(
+        self,
+        inputs_embeds: torch.Tensor,
+        prefix_caches: list[list[SenseNovaU1_5KVCache]],
+        rope_caches: list[tuple[tuple[torch.Tensor, torch.Tensor], ...]],
+    ) -> torch.Tensor:
+        hidden_states = inputs_embeds
+        residual = None
+        for layer_index, layer in enumerate(self.layers):
+            hidden_states, residual = layer.forward_generation_branches(
+                hidden_states,
+                [cache[layer_index] for cache in prefix_caches],
+                rope_caches,
+                residual,
+            )
+        normalized, _ = self.norm_mot_gen(hidden_states, residual)
+        return normalized
+
+    @staticmethod
+    def prepare_generation_cache(
+        prefix_cache: list[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        batch_size: int,
+        generation_length: int,
+    ) -> list[SenseNovaU1_5KVCache]:
+        """Expand prefix KV once and reserve the per-step image-token region."""
+        prepared = []
+        for prefix_key, prefix_value in prefix_cache:
+            prefix_length = prefix_key.shape[1]
+            shape = (
+                batch_size,
+                prefix_length + generation_length,
+                prefix_key.shape[2],
+                prefix_key.shape[3],
+            )
+            key = prefix_key.new_empty(shape)
+            value = prefix_value.new_empty(shape)
+            key[:, :prefix_length].copy_(prefix_key)
+            value[:, :prefix_length].copy_(prefix_value)
+            prepared.append(SenseNovaU1_5KVCache(key, value, prefix_length))
+        return prepared
 
 
 class SenseNovaU1_5LanguageModel(nn.Module):
@@ -770,7 +1003,6 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
             2,
         ),
     }
-    lora_param_names_mapping: dict = {}
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "qkv_proj_mot_gen": [
@@ -793,8 +1025,6 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
             "head_dim", llm_values["hidden_size"] // llm_values["num_attention_heads"]
         )
         llm_values.setdefault("attention_bias", False)
-        llm_values.setdefault("attention_dropout", 0.0)
-        llm_values.setdefault("hidden_act", "silu")
         llm_values.setdefault("pad_token_id", int(config.get("pad_token_id", 151643)))
         llm_values.setdefault("rope_theta_hw", 10000.0)
         self.llm_config = _namespace(llm_values)
@@ -805,9 +1035,7 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         self.vision_config = _namespace(vision_values)
         self.patch_size = int(config.get("patch_size", vision_values["patch_size"]))
         self.downsample_ratio = float(config.get("downsample_ratio", 0.5))
-        self.language_model = SenseNovaU1_5LanguageModel(
-            self.llm_config, quant_config
-        )
+        self.language_model = SenseNovaU1_5LanguageModel(self.llm_config, quant_config)
         self.vision_model = SenseNovaU1_5VisionModel(self.vision_config)
         self.fm_modules = nn.ModuleDict(
             {
@@ -920,17 +1148,13 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
         x = images.reshape(images.shape[0], 3, h, patch_size, w, patch_size)
         permutation = (0, 2, 4, 1, 3, 5) if channel_first else (0, 2, 4, 3, 5, 1)
-        return x.permute(permutation).reshape(
-            images.shape[0], h * w, patch_size**2 * 3
-        )
+        return x.permute(permutation).reshape(images.shape[0], h * w, patch_size**2 * 3)
 
     @staticmethod
     def _unpatchify(x: torch.Tensor, patch_size: int, height: int, width: int):
         h, w = height // patch_size, width // patch_size
         x = x.reshape(x.shape[0], h, w, patch_size, patch_size, 3)
-        return x.permute(0, 5, 1, 3, 2, 4).reshape(
-            x.shape[0], 3, height, width
-        )
+        return x.permute(0, 5, 1, 3, 2, 4).reshape(x.shape[0], 3, height, width)
 
     @staticmethod
     def _shift_timesteps(timesteps: torch.Tensor, shift: float) -> torch.Tensor:
@@ -938,27 +1162,36 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         sigma = shift * sigma / (1 + (shift - 1) * sigma)
         return 1 - sigma
 
-    def _predict_velocity(
+    def _predict_velocity_branches(
         self,
         image_embeds: torch.Tensor,
-        indexes: torch.Tensor,
-        prefix_cache: list[tuple[torch.Tensor, torch.Tensor]],
-        rope_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+        branches: list[
+            tuple[
+                torch.Tensor,
+                list[SenseNovaU1_5KVCache],
+                tuple[tuple[torch.Tensor, torch.Tensor], ...],
+            ]
+        ],
         z: torch.Tensor,
         timestep: torch.Tensor,
         image_size: tuple[int, int],
-    ) -> torch.Tensor:
-        hidden = self.language_model.model.forward_generation(
-            image_embeds, indexes, prefix_cache, rope_cache
+    ) -> list[torch.Tensor]:
+        branch_count = len(branches)
+        hidden = self.language_model.model.forward_generation_branches(
+            image_embeds.repeat(branch_count, 1, 1),
+            [branch[1] for branch in branches],
+            [branch[2] for branch in branches],
         )
         batch, length = z.shape[:2]
         merge = int(1 / self.downsample_ratio)
         token_h = image_size[1] // (self.patch_size * merge)
         token_w = image_size[0] // (self.patch_size * merge)
-        image_2d = hidden.view(batch, token_h, token_w, -1).permute(0, 3, 1, 2)
+        image_2d = hidden.view(branch_count * batch, token_h, token_w, -1).permute(
+            0, 3, 1, 2
+        )
         decoded = self.fm_modules["fm_head"](image_2d)
         decoded = decoded.view(
-            batch,
+            branch_count * batch,
             3,
             token_h,
             self.patch_size * merge,
@@ -966,9 +1199,12 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
             self.patch_size * merge,
         )
         predicted = decoded.permute(0, 2, 4, 3, 5, 1).reshape(
-            batch, length, (self.patch_size * merge) ** 2 * 3
+            branch_count * batch, length, (self.patch_size * merge) ** 2 * 3
         )
-        return (predicted - z) / (1 - timestep).clamp_min(self.t_eps)
+        velocity = (predicted - z.repeat(branch_count, 1, 1)) / (
+            1 - timestep
+        ).clamp_min(self.t_eps)
+        return list(velocity.view(branch_count, batch, length, -1).unbind(0))
 
     def _initial_noise(
         self, batch_size: int, image_size: tuple[int, int], seed: int
@@ -1019,9 +1255,36 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         image, noise_scale, grid_hw = self._initial_noise(batch_size, image_size, seed)
         merge = int(1 / self.downsample_ratio)
         token_h, token_w = int(grid_hw[0, 0]) // merge, int(grid_hw[0, 1]) // merge
+        generation_length = token_h * token_w
+        condition_cache = self.language_model.model.prepare_generation_cache(
+            condition_cache,
+            batch_size=batch_size,
+            generation_length=generation_length,
+        )
+        if uncondition_cache is not None:
+            uncondition_cache = self.language_model.model.prepare_generation_cache(
+                uncondition_cache,
+                batch_size=batch_size,
+                generation_length=generation_length,
+            )
+        if img_condition_cache is not None:
+            img_condition_cache = self.language_model.model.prepare_generation_cache(
+                img_condition_cache,
+                batch_size=batch_size,
+                generation_length=generation_length,
+            )
         timesteps = self._shift_timesteps(
             torch.linspace(0, 1, num_steps + 1, device=self.device), timestep_shift
         )
+        noise_scale_embedding = None
+        if self.add_noise_scale_embedding:
+            noise_scale_embedding = self.fm_modules["noise_scale_embedder"](
+                torch.tensor(
+                    [noise_scale / self.noise_scale_max_value],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            ).view(1, 1, -1)
         rope_caches = {}
         for indexes in (condition_indexes, img_condition_indexes, uncondition_indexes):
             if indexes is not None and id(indexes) not in rope_caches:
@@ -1038,92 +1301,56 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                 ),
                 grid_hw,
             ).view(batch_size, token_h * token_w, -1)
-            expanded = timestep.expand(batch_size * token_h * token_w)
-            time_embed = self.fm_modules["timestep_embedder"](expanded).view_as(embeds)
-            if self.add_noise_scale_embedding:
-                noise_value = torch.full_like(
-                    expanded, noise_scale / self.noise_scale_max_value
-                )
-                time_embed = time_embed + self.fm_modules["noise_scale_embedder"](
-                    noise_value
-                ).view_as(embeds)
+            time_embed = self.fm_modules["timestep_embedder"](timestep.reshape(1)).view(
+                1, 1, -1
+            )
+            if noise_scale_embedding is not None:
+                time_embed = time_embed + noise_scale_embedding
             embeds = embeds + time_embed
-            condition = self._predict_velocity(
+            branches = [(condition_indexes, condition_cache)]
+            if uncondition_cache is None and img_condition_cache is None:
+                branch_names = ("condition",)
+            elif img_condition_cache is None:
+                branches.append((uncondition_indexes, uncondition_cache))
+                branch_names = ("condition", "uncondition")
+            elif uncondition_cache is None:
+                branches.append((img_condition_indexes, img_condition_cache))
+                branch_names = ("condition", "image")
+            elif cfg_scale == 1 and img_cfg_scale == 1:
+                branch_names = ("condition",)
+            elif img_cfg_scale == 1:
+                branches.append((img_condition_indexes, img_condition_cache))
+                branch_names = ("condition", "image")
+            elif cfg_scale == img_cfg_scale:
+                branches.append((uncondition_indexes, uncondition_cache))
+                branch_names = ("condition", "uncondition")
+            else:
+                branches.extend(
+                    [
+                        (img_condition_indexes, img_condition_cache),
+                        (uncondition_indexes, uncondition_cache),
+                    ]
+                )
+                branch_names = ("condition", "image", "uncondition")
+            branch_outputs = self._predict_velocity_branches(
                 embeds,
-                condition_indexes,
-                condition_cache,
-                rope_caches[id(condition_indexes)],
+                [
+                    (indexes, cache, rope_caches[id(indexes)])
+                    for indexes, cache in branches
+                ],
                 z,
                 timestep,
                 image_size,
             )
-            if uncondition_cache is None and img_condition_cache is None:
+            condition = branch_outputs[0]
+            if branch_names == ("condition",):
                 velocity = condition
-            elif img_condition_cache is None:
-                uncondition = self._predict_velocity(
-                    embeds,
-                    uncondition_indexes,
-                    uncondition_cache,
-                    rope_caches[id(uncondition_indexes)],
-                    z,
-                    timestep,
-                    image_size,
+            elif len(branch_outputs) == 2:
+                velocity = branch_outputs[1] + cfg_scale * (
+                    condition - branch_outputs[1]
                 )
-                velocity = uncondition + cfg_scale * (condition - uncondition)
-            elif uncondition_cache is None:
-                image_condition = self._predict_velocity(
-                    embeds,
-                    img_condition_indexes,
-                    img_condition_cache,
-                    rope_caches[id(img_condition_indexes)],
-                    z,
-                    timestep,
-                    image_size,
-                )
-                velocity = image_condition + cfg_scale * (condition - image_condition)
-            elif cfg_scale == 1 and img_cfg_scale == 1:
-                velocity = condition
-            elif img_cfg_scale == 1:
-                image_condition = self._predict_velocity(
-                    embeds,
-                    img_condition_indexes,
-                    img_condition_cache,
-                    rope_caches[id(img_condition_indexes)],
-                    z,
-                    timestep,
-                    image_size,
-                )
-                velocity = image_condition + cfg_scale * (condition - image_condition)
-            elif cfg_scale == img_cfg_scale:
-                uncondition = self._predict_velocity(
-                    embeds,
-                    uncondition_indexes,
-                    uncondition_cache,
-                    rope_caches[id(uncondition_indexes)],
-                    z,
-                    timestep,
-                    image_size,
-                )
-                velocity = uncondition + cfg_scale * (condition - uncondition)
             else:
-                image_condition = self._predict_velocity(
-                    embeds,
-                    img_condition_indexes,
-                    img_condition_cache,
-                    rope_caches[id(img_condition_indexes)],
-                    z,
-                    timestep,
-                    image_size,
-                )
-                uncondition = self._predict_velocity(
-                    embeds,
-                    uncondition_indexes,
-                    uncondition_cache,
-                    rope_caches[id(uncondition_indexes)],
-                    z,
-                    timestep,
-                    image_size,
-                )
+                image_condition, uncondition = branch_outputs[1:]
                 velocity = (
                     uncondition
                     + cfg_scale * (condition - image_condition)
@@ -1157,20 +1384,19 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         cfg_scale: float = 4.0,
         cfg_norm: str = "none",
         timestep_shift: float = 3.0,
+        t_eps: float = 0.02,
         image_size: tuple[int, int] = (2048, 2048),
         num_steps: int = 50,
         batch_size: int = 1,
-        think_mode: bool = False,
         seed: int = 0,
         **_: Any,
     ) -> torch.Tensor:
-        if think_mode:
-            raise NotImplementedError("SenseNova-U1.5 thinking mode is not implemented")
+        self.t_eps = float(t_eps)
         suffix = "<think>\n\n</think>\n\n<img>"
         query = self._query(prompt, system_message=SYSTEM_MESSAGE_FOR_GEN) + suffix
         ids = tokenizer(query, return_tensors="pt")["input_ids"].to(self.device)
         indexes = self._text_indexes(ids.shape[1], self.device)
-        condition_cache, _ = self.language_model.model.forward_prefix(
+        condition_cache = self.language_model.model.forward_prefix(
             indexes, input_ids=ids
         )
         merge = int(1 / self.downsample_ratio)
@@ -1186,7 +1412,7 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                 self.device
             )
             uncond_text_indexes = self._text_indexes(uncond_ids.shape[1], self.device)
-            uncondition_cache, _ = self.language_model.model.forward_prefix(
+            uncondition_cache = self.language_model.model.forward_prefix(
                 uncond_text_indexes, input_ids=uncond_ids
             )
             uncondition_indexes = self._image_indexes(
@@ -1219,14 +1445,14 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         embeds = self.language_model.model.embed_tokens(ids)
         if pixel_values is not None:
             if visual_embeds is None:
-                visual_embeds = self.vision_model(pixel_values, grid_hw).to(embeds.dtype)
+                visual_embeds = self.vision_model(pixel_values, grid_hw).to(
+                    embeds.dtype
+                )
             elif visual_embeds.dtype != embeds.dtype:
                 visual_embeds = visual_embeds.to(embeds.dtype)
             selected = ids[0] == self.img_context_token_id
             embeds[0, selected] = visual_embeds
-        cache, _ = self.language_model.model.forward_prefix(
-            indexes, inputs_embeds=embeds
-        )
+        cache = self.language_model.model.forward_prefix(indexes, inputs_embeds=embeds)
         return cache, int(indexes[0].max().item()) + 1
 
     @torch.inference_mode()
@@ -1239,23 +1465,30 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         img_cfg_scale: float = 1.0,
         cfg_norm: str = "none",
         timestep_shift: float = 3.0,
+        t_eps: float = 0.02,
         image_size: tuple[int, int] = (2048, 2048),
         num_steps: int = 50,
         batch_size: int = 1,
-        think_mode: bool = False,
         seed: int = 0,
         **_: Any,
     ) -> torch.Tensor:
-        if think_mode:
-            raise NotImplementedError("SenseNova-U1.5 thinking mode is not implemented")
+        self.t_eps = float(t_eps)
         self.img_context_token_id = tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
         self.img_start_token_id = tokenizer.convert_tokens_to_ids("<img>")
         image_count = prompt.count("<image>")
+        if image_count > len(images):
+            raise ValueError(
+                f"prompt contains {image_count} <image> placeholders, but only "
+                f"{len(images)} reference images were supplied"
+            )
         if image_count == 0:
             if len(images) > 1:
-                prompt = "".join(
-                    f"Image-{index + 1}:<image>\n" for index in range(len(images))
-                ) + prompt
+                prompt = (
+                    "".join(
+                        f"Image-{index + 1}:<image>\n" for index in range(len(images))
+                    )
+                    + prompt
+                )
             else:
                 prompt = "<image>\n" + prompt
         elif image_count < len(images):

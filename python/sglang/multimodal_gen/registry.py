@@ -95,6 +95,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1_5 import (
+    SenseNovaU1_5PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
@@ -172,6 +175,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1_5 import (
+    SenseNovaU1_5SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
@@ -334,6 +340,7 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1_5Pipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
@@ -344,6 +351,15 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+}
+
+# Native SenseNova checkpoints are also commonly materialized as local
+# training variants, for example ``SenseNova-U1.5-8B-MoT-EMA-1500step`` or
+# ``SenseNova-U1.5-8B-MoT-sft-distill``.  Those directories intentionally do
+# not contain a Diffusers ``model_index.json``; match the canonical model
+# basename as a prefix so they continue to use the native pipeline.
+KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PREFIX_PATTERNS: Dict[str, str] = {
+    "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1_5Pipeline",
 }
 
 
@@ -760,6 +776,16 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    register_configs(
+        sampling_param_cls=SenseNovaU1_5SamplingParams,
+        pipeline_config_cls=SenseNovaU1_5PipelineConfig,
+        hf_model_paths=["sensenova/SenseNova-U1.5-8B-MoT"],
+        model_detectors=[
+            lambda path: "sensenova-u1.5" in path.lower()
+            or "sensenovau1_5" in path.lower()
+        ],
+    )
+
     # Pi0.5 / OpenPI / LeRobot action policies.
     register_configs(
         sampling_param_cls=Pi05SamplingParams,
@@ -1353,6 +1379,22 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
             or model_short_name == get_model_short_name(pattern)
             or f"models--{pattern.replace('/', '--')}" in normalized_model_path
         ):
+            return pipeline_name
+
+    # Local training checkpoints may append a variant/step suffix to the
+    # canonical model basename.  Check this separately from the exact aliases
+    # above so only the final path component is treated as a prefix; a parent
+    # directory merely containing the model name must not trigger detection.
+    prefix_patterns = KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PREFIX_PATTERNS.items()
+    for pattern, pipeline_name in prefix_patterns:
+        pattern = pattern.lower()
+        pattern_short_name = get_model_short_name(pattern)
+        if model_short_name.startswith(pattern_short_name):
+            return pipeline_name
+        # Preserve recognition for Hugging Face cache snapshots whose final
+        # component is a hash rather than the repository basename.
+        cache_pattern = f"models--{pattern.replace('/', '--')}"
+        if cache_pattern in normalized_model_path:
             return pipeline_name
     return None
 

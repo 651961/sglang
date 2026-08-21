@@ -95,6 +95,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1_5 import (
+    SenseNovaU1_5PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
@@ -172,6 +175,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1_5 import (
+    SenseNovaU1_5SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
@@ -334,6 +340,7 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1_5Pipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
@@ -760,6 +767,16 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    register_configs(
+        sampling_param_cls=SenseNovaU1_5SamplingParams,
+        pipeline_config_cls=SenseNovaU1_5PipelineConfig,
+        hf_model_paths=["sensenova/SenseNova-U1.5-8B-MoT"],
+        model_detectors=[
+            lambda path: "sensenova-u1.5" in path.lower()
+            or "sensenovau1_5" in path.lower()
+        ],
+    )
+
     # Pi0.5 / OpenPI / LeRobot action policies.
     register_configs(
         sampling_param_cls=Pi05SamplingParams,

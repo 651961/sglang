@@ -85,6 +85,28 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     parser = SamplingParams.add_cli_args(parser)
 
     parser.add_argument(
+        "--cfg-scale", dest="cfg_scale", type=float, default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--img-cfg-scale", dest="img_cfg_scale", type=float, default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--cfg-norm",
+        dest="cfg_norm",
+        choices=["none", "global", "channel"],
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--timestep-shift", dest="timestep_shift", type=float, default=argparse.SUPPRESS
+    )
+    parser.add_argument("--t-eps", dest="t_eps", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--target-pixels", dest="target_pixels", type=int, default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--input-max-pixels", dest="input_max_pixels", default=argparse.SUPPRESS
+    )
+    parser.add_argument(
         "--text-encoder-configs",
         action=RaiseNotImplementedAction,
         help="JSON array of text encoder configurations (NOT YET IMPLEMENTED)",

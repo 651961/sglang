@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
@@ -70,6 +71,7 @@ if USE_AITER or _use_hip_int4:
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+WEIGHT_SCALE_STRATEGIES = ["tensor", "channel"]
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,7 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        weight_scale_strategy: str = "tensor",
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
@@ -97,6 +100,16 @@ class Fp8Config(QuantizationConfig):
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
         self.packed_modules_mapping = packed_modules_mapping or {}
+        if weight_scale_strategy not in WEIGHT_SCALE_STRATEGIES:
+            raise ValueError(
+                f"Unsupported weight scale strategy {weight_scale_strategy}"
+            )
+        if weight_scale_strategy == "channel" and not is_checkpoint_fp8_serialized:
+            raise ValueError(
+                "Channel-wise weight scales are only supported for serialized "
+                "FP8 checkpoints."
+            )
+        self.weight_scale_strategy = weight_scale_strategy
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -109,6 +122,11 @@ class Fp8Config(QuantizationConfig):
             if activation_scheme != "dynamic":
                 raise ValueError(
                     f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
+                )
+            if weight_scale_strategy != "tensor":
+                raise ValueError(
+                    "weight_scale_strategy does not apply to block-wise FP8 "
+                    "checkpoints."
                 )
         self.weight_block_size = weight_block_size
 
@@ -140,11 +158,15 @@ class Fp8Config(QuantizationConfig):
             # hacking ministral
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        weight_scale_strategy = cls.get_from_keys_or(
+            config, ["weight_scale_strategy"], "tensor"
+        )
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            weight_scale_strategy=weight_scale_strategy,
         )
 
     def get_quant_method(
@@ -283,6 +305,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale.format_ue8m0 = False
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
+            elif (
+                getattr(self.quant_config, "weight_scale_strategy", "tensor")
+                == "channel"
+            ):
+                scale = ChannelQuantScaleParameter(
+                    data=torch.empty(output_size_per_partition, 1, dtype=torch.float32),
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", scale)
             else:
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
@@ -398,8 +431,14 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.data, requires_grad=False
                     )
 
+                if (
+                    getattr(self.quant_config, "weight_scale_strategy", "tensor")
+                    == "channel"
+                ):
+                    weight = layer.weight
+                    weight_scale = layer.weight_scale.t().contiguous()
                 # cutlass sgl-kernel and marlin only support per-channel scale
-                if self.cutlass_fp8_supported or self.use_marlin:
+                elif self.cutlass_fp8_supported or self.use_marlin:
                     weight = layer.weight
                     weight_scale = convert_to_channelwise(
                         layer.weight_scale, layer.logical_widths

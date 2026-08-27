@@ -788,6 +788,17 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_group=tp_group,
         )
 
+    @staticmethod
+    def _normalize_loaded_shard_id(loaded_shard_id: str | int | None):
+        if isinstance(loaded_shard_id, int):
+            if 0 <= loaded_shard_id < 3:
+                return ("q", "k", "v")[loaded_shard_id]
+            raise ValueError(
+                "QKV shard id must be 0, 1, 2, 'q', 'k', or 'v'; "
+                f"got {loaded_shard_id}"
+            )
+        return loaded_shard_id
+
     def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
         shard_offset_mapping = {
             "q": 0,
@@ -853,8 +864,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         self,
         param: BasevLLMParameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: str | None = None,
+        loaded_shard_id: str | int | None = None,
     ):
+        loaded_shard_id = self._normalize_loaded_shard_id(loaded_shard_id)
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
                 if loaded_weight.numel() == 1 and param.data.numel() > 1:
@@ -889,8 +901,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         self,
         param: Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: str | None = None,
+        loaded_shard_id: str | int | None = None,
     ):
+        loaded_shard_id = self._normalize_loaded_shard_id(loaded_shard_id)
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.

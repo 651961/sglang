@@ -9,6 +9,7 @@ import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    GetGpuUuidsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -48,6 +49,7 @@ _CONTROL_REQ_TYPES = (
     UpdateWeightFromTensorReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     GetWeightsChecksumReqInput,
+    GetGpuUuidsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )

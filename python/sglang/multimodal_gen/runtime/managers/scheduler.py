@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    GetGpuUuidsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -154,6 +155,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self._handle_update_weights_from_tensor_checker
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            GetGpuUuidsReqInput: self._handle_get_gpu_uuids,
             ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
             ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }

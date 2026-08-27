@@ -44,3 +44,7 @@ class SchedulerPostTrainingMixin:
         req = reqs[0]
         checksums = self.worker.get_weights_checksum(module_names=req.module_names)
         return OutputBatch(output=checksums)
+
+    def _handle_get_gpu_uuids(self, reqs: List[Any]) -> OutputBatch:
+        del reqs
+        return OutputBatch(output=self.worker.get_gpu_uuids())

@@ -36,6 +36,7 @@ class RolloutDebugTensors:
     rollout_prev_sample_means: torch.Tensor | None = None
     rollout_noise_std_devs: torch.Tensor | None = None
     rollout_model_outputs: torch.Tensor | None = None
+    step_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -57,8 +58,30 @@ class RolloutDitTrajectory:
 
 
 @dataclass
+class RolloutTransitionPairs:
+    """Selected stochastic transitions used by policy-gradient training.
+
+    Unlike ``RolloutDitTrajectory``, these tensors do not imply that adjacent
+    entries are consecutive denoising states. Each row is an explicit
+    ``(x_i, x_{i+1})`` pair identified by ``step_indices``. ``next_latents``
+    may retain the sampler's fp32 action before the model-input dtype cast so
+    trainer-side log-prob recomputation matches the rollout policy exactly.
+    """
+
+    step_indices: torch.Tensor | None = None  # [K]
+    latents: torch.Tensor | None = None  # [B, K, ...]
+    next_latents: torch.Tensor | None = None  # [B, K, ...]
+    timesteps: torch.Tensor | None = None  # [K], model-native time coordinates
+    next_timesteps: torch.Tensor | None = None  # [K], model-native coordinates
+    sigmas: torch.Tensor | None = None  # [K], normalized flow sigma
+    next_sigmas: torch.Tensor | None = None  # [K], normalized flow sigma
+    base_noise_scale: float | None = None
+
+
+@dataclass
 class RolloutTrajectoryData:
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
     denoising_env: RolloutDenoisingEnv | None = None
     dit_trajectory: RolloutDitTrajectory | None = None
+    transition_pairs: RolloutTransitionPairs | None = None

@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
+    RolloutTransitionPairs,
     RolloutTrajectoryData,
 )
 
@@ -162,6 +163,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             rollout_prev_sample_means=torch.randn(2, 5, 4, 8, 8),
             rollout_noise_std_devs=torch.randn(2, 5, 1),
             rollout_model_outputs=torch.randn(2, 5, 4, 8, 8),
+            step_indices=torch.tensor([1, 3, 5, 7, 9]),
         )
         rtd = RolloutTrajectoryData(
             rollout_log_probs=torch.tensor([-0.5, -0.6]),
@@ -176,7 +178,9 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIn("rollout_prev_sample_means", debug)
         self.assertIn("rollout_noise_std_devs", debug)
         self.assertIn("rollout_model_outputs", debug)
+        self.assertIn("step_indices", debug)
         self.assertTrue(debug["rollout_variance_noises"]["__tensor__"])
+        self.assertTrue(debug["step_indices"]["__tensor__"])
 
     def test_debug_tensors_with_none_fields(self):
         dt = RolloutDebugTensors(
@@ -352,6 +356,88 @@ class TestBuildResponse(unittest.TestCase):
             _maybe_deserialize(resps[1].dit_trajectory["latents"]).shape, (T + 1, D)
         )
 
+    def test_batch_splits_transition_pairs_and_preserves_dtypes(self):
+        B, K, C, H, W = 3, 2, 3, 4, 5
+        latents = (
+            torch.arange(B * K * C * H * W, dtype=torch.float32)
+            .reshape(B, K, C, H, W)
+            .to(torch.bfloat16)
+        )
+        next_latents = latents.float() + 0.125
+        step_indices = torch.tensor([1, 4], dtype=torch.int64)
+        timesteps = torch.tensor([0.2, 0.8], dtype=torch.float32)
+        next_timesteps = torch.tensor([0.4, 1.0], dtype=torch.float32)
+        sigmas = 1.0 - timesteps
+        next_sigmas = 1.0 - next_timesteps
+        batch = OutputBatch(
+            output=torch.randn(B, C, H, W),
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.randn(B, 6),
+                rollout_debug_tensors=RolloutDebugTensors(
+                    rollout_variance_noises=torch.randn(B, K, C, H, W),
+                    rollout_prev_sample_means=torch.randn(B, K, C, H, W),
+                    rollout_noise_std_devs=torch.randn(B, K, 1),
+                    rollout_model_outputs=torch.randn(B, K, C, H, W),
+                    step_indices=step_indices,
+                ),
+                transition_pairs=RolloutTransitionPairs(
+                    step_indices=step_indices,
+                    latents=latents,
+                    next_latents=next_latents,
+                    timesteps=timesteps,
+                    next_timesteps=next_timesteps,
+                    sigmas=sigmas,
+                    next_sigmas=next_sigmas,
+                    base_noise_scale=8.0,
+                ),
+            ),
+        )
+        batch.metrics = self._make_metrics(1.0)
+
+        resps = _build_response("rp", "edit", 7, True, batch)
+
+        self.assertEqual(len(resps), B)
+        for sample_idx, resp in enumerate(resps):
+            self.assertIsNotNone(resp.transition_pairs)
+            serialized_pairs = resp.transition_pairs
+            sample_latents = _maybe_deserialize(serialized_pairs["latents"])
+            sample_next_latents = _maybe_deserialize(serialized_pairs["next_latents"])
+            sample_step_indices = _maybe_deserialize(serialized_pairs["step_indices"])
+            sample_timesteps = _maybe_deserialize(serialized_pairs["timesteps"])
+            sample_next_timesteps = _maybe_deserialize(
+                serialized_pairs["next_timesteps"]
+            )
+            sample_sigmas = _maybe_deserialize(serialized_pairs["sigmas"])
+            sample_next_sigmas = _maybe_deserialize(
+                serialized_pairs["next_sigmas"]
+            )
+
+            self.assertEqual(tuple(sample_latents.shape), (K, C, H, W))
+            self.assertEqual(tuple(sample_next_latents.shape), (K, C, H, W))
+            self.assertEqual(sample_latents.dtype, torch.bfloat16)
+            self.assertEqual(sample_next_latents.dtype, torch.float32)
+            self.assertEqual(sample_step_indices.dtype, torch.int64)
+            self.assertEqual(sample_timesteps.dtype, torch.float32)
+            self.assertEqual(sample_next_timesteps.dtype, torch.float32)
+            self.assertEqual(sample_sigmas.dtype, torch.float32)
+            self.assertEqual(sample_next_sigmas.dtype, torch.float32)
+            self.assertTrue(torch.equal(sample_latents, latents[sample_idx]))
+            self.assertTrue(torch.equal(sample_next_latents, next_latents[sample_idx]))
+            self.assertTrue(torch.equal(sample_step_indices, step_indices))
+            self.assertTrue(torch.equal(sample_timesteps, timesteps))
+            self.assertTrue(torch.equal(sample_next_timesteps, next_timesteps))
+            self.assertTrue(torch.equal(sample_sigmas, sigmas))
+            self.assertTrue(torch.equal(sample_next_sigmas, next_sigmas))
+            self.assertEqual(serialized_pairs["base_noise_scale"], 8.0)
+            sample_debug_noise = _maybe_deserialize(
+                resp.rollout_debug_tensors["rollout_variance_noises"]
+            )
+            sample_debug_indices = _maybe_deserialize(
+                resp.rollout_debug_tensors["step_indices"]
+            )
+            self.assertEqual(tuple(sample_debug_noise.shape), (K, C, H, W))
+            self.assertTrue(torch.equal(sample_debug_indices, step_indices))
+
     def test_rollout_false_omits_trajectory(self):
         batch = OutputBatch(
             output=torch.randn(2, 1, 8, 8),
@@ -399,6 +485,25 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         self.assertNotIn("rollout_sde_step_indices", kwargs)
         self.assertNotIn("rollout_return_step_indices", kwargs)
 
+    def test_rollout_debug_mode_defaults_to_false(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        request = self._make_request()
+        self.assertFalse(request.rollout_debug_mode)
+        self.assertIs(_build_sampling_kwargs(request)["rollout_debug_mode"], False)
+
+    def test_transition_pair_flag_forwarded(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(rollout_return_transition_pairs=True)
+        )
+        self.assertIs(kwargs["rollout_return_transition_pairs"], True)
+
     def test_sampling_params_exposes_filters_via_req_getattr(self):
         from sglang.multimodal_gen.configs.sample.sampling_params import (
             SamplingParams,
@@ -411,10 +516,12 @@ class TestBuildSamplingKwargs(unittest.TestCase):
             rollout=True,
             rollout_sde_step_indices=[0, 2],
             rollout_return_step_indices=[1, 3],
+            rollout_return_transition_pairs=True,
         )
         req = Req(sampling_params=sp)
         self.assertEqual(req.rollout_sde_step_indices, [0, 2])
         self.assertEqual(req.rollout_return_step_indices, [1, 3])
+        self.assertTrue(req.rollout_return_transition_pairs)
 
 
 if __name__ == "__main__":

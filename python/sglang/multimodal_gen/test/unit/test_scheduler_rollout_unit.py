@@ -390,6 +390,61 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 msg=f"{sde_type}: noise_buffer must be fp32 with bf16 model_output",
             )
 
+    def test_variance_noise_generator_list_draws_one_sample_per_generator(self):
+        scheduler = _DummyScheduler()
+        shape = (3, 2, 4, 5)
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda _batch, latents: (latents, False)
+        )
+        batch = self._build_batch(sde_type="sde", shape=shape)
+        scheduler.prepare_rollout(batch=batch, pipeline_config=pipeline_config)
+
+        seeds = (11, 23, 37)
+        generators = [torch.Generator(device="cpu").manual_seed(seed) for seed in seeds]
+        model_output = torch.empty(shape, dtype=torch.float32)
+        variance_noise = scheduler._rollout_variance_noise(
+            batch, model_output, generators
+        )
+
+        expected_rows = []
+        expected_generator_tails = []
+        for seed in seeds:
+            reference_generator = torch.Generator(device="cpu").manual_seed(seed)
+            expected_rows.append(
+                torch.randn(
+                    (1, *shape[1:]),
+                    generator=reference_generator,
+                    dtype=model_output.dtype,
+                )
+            )
+            expected_generator_tails.append(
+                torch.randn((), generator=reference_generator)
+            )
+
+        expected = torch.cat(expected_rows, dim=0)
+        self.assertEqual(tuple(variance_noise.shape), shape)
+        self.assertEqual(variance_noise.dtype, model_output.dtype)
+        self.assertTrue(torch.equal(variance_noise, expected))
+
+        # Each per-sample generator must advance by exactly one sample-shaped
+        # draw. Drawing the full batch shape for each row can appear to fill
+        # the returned buffer correctly while silently consuming B times as
+        # much RNG state.
+        actual_generator_tails = [
+            torch.randn((), generator=generator) for generator in generators
+        ]
+        for actual, expected_tail in zip(
+            actual_generator_tails, expected_generator_tails, strict=True
+        ):
+            self.assertTrue(torch.equal(actual, expected_tail))
+
+        # A mismatched out= shape may also resize the backing storage of a
+        # sliced row even though the buffer's logical shape remains unchanged.
+        expected_storage_bytes = variance_noise.numel() * variance_noise.element_size()
+        self.assertEqual(
+            variance_noise.untyped_storage().nbytes(), expected_storage_bytes
+        )
+
     def test_timestep_filters_gate_sde_and_trajectory(self):
         """Per-step index filters: rollout_sde_step_indices gates variance-noise
         injection (excluded steps = ODE transition + zero log-prob); independently,

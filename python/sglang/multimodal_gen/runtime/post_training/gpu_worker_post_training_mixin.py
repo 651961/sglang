@@ -35,6 +35,9 @@ def _normalize_gpu_uuid(uuid: str) -> str:
 
 
 class GPUWorkerPostTrainingMixin:
+    def get_gpu_uuids(self) -> list[str]:
+        return [str(current_platform.get_device_uuid(self.local_rank))]
+
     def update_weights_from_disk(
         self,
         model_path: str,

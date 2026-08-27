@@ -273,6 +273,9 @@ class SamplingParams:
     rollout_return_dit_trajectory: bool = (
         False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     )
+    rollout_return_transition_pairs: bool = (
+        False  # selected (x_i, x_{i+1}) pairs for memory-efficient policy replay
+    )
     # 0-indexed denoising-loop step filters; None = all steps.
     rollout_sde_step_indices: list[int] | None = None
     rollout_return_step_indices: list[int] | None = None

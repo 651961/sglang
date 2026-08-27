@@ -4,6 +4,7 @@ from fastapi import APIRouter, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    GetGpuUuidsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -14,6 +15,16 @@ from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_clien
 from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter()
+
+
+@router.post("/get_gpu_uuids")
+async def get_gpu_uuids():
+    """Return the CUDA UUIDs reported by the live scheduler workers."""
+    try:
+        response = await async_scheduler_client.forward(GetGpuUuidsReqInput())
+    except Exception as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=500)
+    return orjson_response(response.output, status_code=200)
 
 
 @router.post("/update_weights_from_disk")

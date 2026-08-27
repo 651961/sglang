@@ -95,9 +95,10 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         buffer = self._get_or_create_rollout_noise_buffer(
             rollout_session_data, rollout_session_data.latents_shape, device, dtype
         )
+        sample_shape = (1, *rollout_session_data.latents_shape[1:])
         for i in range(B):
             torch.randn(
-                rollout_session_data.latents_shape,
+                sample_shape,
                 out=buffer[i : i + 1],
                 generator=generator[i],
             )
@@ -119,9 +120,14 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         sample: torch.FloatTensor,
         current_sigma: torch.FloatTensor,
         next_sigma: torch.FloatTensor,
-        generator: torch.Generator,
+        generator: Union[torch.Generator, list[torch.Generator]],
+        base_noise_scale: float = 1.0,
     ) -> torch.Tensor:
         """Flow rollout step for log-prob / sampling (see FlowGRPO-style references).
+
+        ``base_noise_scale`` is the standard deviation of the flow's source
+        Gaussian. It scales only the stochastic increment and its log-density;
+        the sigma schedule remains normalized to [1, 0].
 
         ``rollout_sde_type`` (from batch SamplingParams):
 
@@ -132,6 +138,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         rollout_session_data = self._get_rollout_session_data(batch)
         sde_type = batch.rollout_sde_type
         noise_level = float(batch.rollout_noise_level)
+        base_noise_scale = float(base_noise_scale)
+        if base_noise_scale <= 0:
+            raise ValueError("base_noise_scale must be positive")
         log_prob_no_const = batch.rollout_log_prob_no_const
         debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
 
@@ -184,7 +193,10 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 )
                 * noise_level
             )
-            noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
+            # ``std_dev_t`` stays in normalized-sigma units in the drift
+            # correction. The Brownian increment is in pixel/latent units and
+            # therefore carries the source Gaussian's scale.
+            noise_std_dev = base_noise_scale * std_dev_t * torch.sqrt(-1 * dt)
             prev_sample_mean = (
                 sample * (1 + std_dev_t**2 / (2 * current_sigma) * dt)
                 + model_output
@@ -204,7 +216,10 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             )
             full_variance_noise = rollout_session_data.noise_buffer
             std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
-            noise_std_dev = std_dev_t
+            # The retained noise estimate already has variance
+            # ``base_noise_scale**2``. Scale the independent CPS innovation by
+            # the same amount to preserve that marginal.
+            noise_std_dev = base_noise_scale * std_dev_t
             pred_original_sample = sample - current_sigma * model_output
             noise_estimate = sample + model_output * (1 - current_sigma)
             prev_sample_mean = pred_original_sample * (

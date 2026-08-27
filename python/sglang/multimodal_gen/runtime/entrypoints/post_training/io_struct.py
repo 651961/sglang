@@ -47,6 +47,13 @@ class GetWeightsChecksumReqInput:
 
 
 @dataclass
+class GetGpuUuidsReqInput:
+    """Return the CUDA UUIDs of the live scheduler workers."""
+
+    pass
+
+
+@dataclass
 class ReleaseMemoryOccupationReqInput:
     """Request to release (sleep) GPU memory occupation for the diffusion engine."""
 
@@ -82,10 +89,11 @@ class RolloutRequest(BaseModel):
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
-    rollout_debug_mode: bool = True
+    rollout_debug_mode: bool = False
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
+    rollout_return_transition_pairs: bool = False
 
     # 0-indexed denoising-loop step filters. None = all steps.
     rollout_sde_step_indices: Optional[list[int]] = None
@@ -110,6 +118,7 @@ class RolloutResponse(BaseModel):
     rollout_debug_tensors: Optional[dict[str, Any]] = None
     denoising_env: Optional[dict[str, Any]] = None
     dit_trajectory: Optional[dict[str, Any]] = None
+    transition_pairs: Optional[dict[str, Any]] = None
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None

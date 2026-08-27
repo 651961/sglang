@@ -55,3 +55,13 @@ def test_qkv_parallel_full_scale_vector_loads_all_fused_slots():
     layer.weight_loader_v2(param, torch.tensor([0.25, 0.5, 0.75]))
 
     assert torch.equal(param.data, torch.tensor([0.25, 0.5, 0.75]))
+
+
+@pytest.mark.parametrize("integer_id,name", [(0, "q"), (1, "k"), (2, "v")])
+def test_qkv_parallel_accepts_integer_mapping_shard_ids(integer_id, name):
+    assert QKVParallelLinear._normalize_loaded_shard_id(integer_id) == name
+
+
+def test_qkv_parallel_rejects_unknown_integer_mapping_shard_id():
+    with pytest.raises(ValueError, match="QKV shard id"):
+        QKVParallelLinear._normalize_loaded_shard_id(3)

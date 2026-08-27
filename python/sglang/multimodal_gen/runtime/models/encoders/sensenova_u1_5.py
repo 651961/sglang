@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.nn as nn
@@ -1354,7 +1354,11 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         return list(velocity.view(branch_count, batch, length, -1).unbind(0))
 
     def _initial_noise(
-        self, batch_size: int, image_size: tuple[int, int], seed: int
+        self,
+        batch_size: int,
+        image_size: tuple[int, int],
+        seed: int,
+        generators: list[torch.Generator] | None = None,
     ) -> tuple[torch.Tensor, float, torch.Tensor]:
         merge = int(1 / self.downsample_ratio)
         grid_h, grid_w = (
@@ -1372,13 +1376,32 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
             if self.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
-        generator = torch.Generator(self.device).manual_seed(seed)
-        image = noise_scale * torch.randn(
-            (batch_size, 3, image_size[1], image_size[0]),
-            device=self.device,
-            dtype=self.dtype,
-            generator=generator,
-        )
+        noise_shape = (1, 3, image_size[1], image_size[0])
+        if generators is None:
+            generator = torch.Generator(self.device).manual_seed(seed)
+            image = noise_scale * torch.randn(
+                (batch_size, *noise_shape[1:]),
+                device=self.device,
+                dtype=self.dtype,
+                generator=generator,
+            )
+        else:
+            if len(generators) != batch_size:
+                raise ValueError(
+                    f"Expected {batch_size} generators, got {len(generators)}"
+                )
+            image = noise_scale * torch.cat(
+                [
+                    torch.randn(
+                        noise_shape,
+                        device=self.device,
+                        dtype=self.dtype,
+                        generator=generator,
+                    )
+                    for generator in generators
+                ],
+                dim=0,
+            )
         grid_hw = torch.tensor([[grid_h, grid_w]] * batch_size, device=self.device)
         return image, noise_scale, grid_hw
 
@@ -1398,8 +1421,27 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         img_condition_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         img_condition_indexes: torch.Tensor | None = None,
         img_cfg_scale: float = 1.0,
+        generators: list[torch.Generator] | None = None,
+        denoise_start_callback: Callable[
+            [torch.Tensor, float, torch.Tensor], None
+        ]
+        | None = None,
+        denoise_step_callback: Callable[
+            [
+                int,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+            torch.Tensor,
+        ]
+        | None = None,
     ) -> torch.Tensor:
-        image, noise_scale, grid_hw = self._initial_noise(batch_size, image_size, seed)
+        image, noise_scale, grid_hw = self._initial_noise(
+            batch_size, image_size, seed, generators=generators
+        )
         merge = int(1 / self.downsample_ratio)
         grid_h = image_size[1] // self.patch_size
         grid_w = image_size[0] // self.patch_size
@@ -1425,6 +1467,8 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         timesteps = self._shift_timesteps(
             torch.linspace(0, 1, num_steps + 1, device=self.device), timestep_shift
         )
+        if denoise_start_callback is not None:
+            denoise_start_callback(image, noise_scale, timesteps)
         timestep_embeddings = self.fm_modules["timestep_embedder"](timesteps[:-1]).view(
             num_steps, 1, 1, -1
         )
@@ -1529,7 +1573,36 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
                     / (torch.norm(velocity, dim=-1, keepdim=True) + 1e-8)
                 ).clamp(max=1)
                 velocity = velocity * scale
-            if use_bchw:
+            if denoise_step_callback is not None:
+                velocity_bchw = (
+                    velocity
+                    if use_bchw
+                    else self._unpatchify(
+                        velocity,
+                        self.patch_size * merge,
+                        image_size[1],
+                        image_size[0],
+                    )
+                )
+                native_next_image = (
+                    image + (next_timestep - timestep) * velocity
+                    if use_bchw
+                    else self._unpatchify(
+                        z + (next_timestep - timestep) * velocity,
+                        self.patch_size * merge,
+                        image_size[1],
+                        image_size[0],
+                    )
+                )
+                image = denoise_step_callback(
+                    step,
+                    image,
+                    velocity_bchw,
+                    timestep,
+                    next_timestep,
+                    native_next_image,
+                )
+            elif use_bchw:
                 image = image + (next_timestep - timestep) * velocity
             else:
                 image = self._unpatchify(
@@ -1553,6 +1626,23 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         num_steps: int = 50,
         batch_size: int = 1,
         seed: int = 0,
+        generators: list[torch.Generator] | None = None,
+        denoise_start_callback: Callable[
+            [torch.Tensor, float, torch.Tensor], None
+        ]
+        | None = None,
+        denoise_step_callback: Callable[
+            [
+                int,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+            torch.Tensor,
+        ]
+        | None = None,
         **_: Any,
     ) -> torch.Tensor:
         self.t_eps = float(t_eps)
@@ -1594,6 +1684,9 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
             cfg_norm,
             uncondition_cache,
             uncondition_indexes,
+            generators=generators,
+            denoise_start_callback=denoise_start_callback,
+            denoise_step_callback=denoise_step_callback,
         )
 
     def _editing_prefix(
@@ -1634,6 +1727,23 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
         num_steps: int = 50,
         batch_size: int = 1,
         seed: int = 0,
+        generators: list[torch.Generator] | None = None,
+        denoise_start_callback: Callable[
+            [torch.Tensor, float, torch.Tensor], None
+        ]
+        | None = None,
+        denoise_step_callback: Callable[
+            [
+                int,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+            torch.Tensor,
+        ]
+        | None = None,
         **_: Any,
     ) -> torch.Tensor:
         self.t_eps = float(t_eps)
@@ -1729,6 +1839,9 @@ class SenseNovaU1_5NativeModel(nn.Module, LayerwiseOffloadableModuleMixin):
             image_cache,
             image_indexes,
             img_cfg_scale,
+            generators=generators,
+            denoise_start_callback=denoise_start_callback,
+            denoise_step_callback=denoise_step_callback,
         )
 
 

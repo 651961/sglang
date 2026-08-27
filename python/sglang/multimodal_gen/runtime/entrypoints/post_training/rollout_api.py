@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
+    RolloutTransitionPairs,
     RolloutTrajectoryData,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -94,6 +95,7 @@ def _slice_rollout_trajectory_for_sample(
             rollout_model_outputs=_extract_single_sample_tensor(
                 rd.rollout_model_outputs, sample_idx, batch_size
             ),
+            step_indices=rd.step_indices,
         )
     denoising_env = None
     if rtd.denoising_env:
@@ -132,12 +134,47 @@ def _slice_rollout_trajectory_for_sample(
             timesteps=dit.timesteps,
             sigmas=dit.sigmas,
         )
+    transition_pairs = None
+    if rtd.transition_pairs:
+        pairs = rtd.transition_pairs
+        transition_pairs = RolloutTransitionPairs(
+            step_indices=pairs.step_indices,
+            latents=_extract_single_sample_tensor(
+                pairs.latents, sample_idx, batch_size
+            ),
+            next_latents=_extract_single_sample_tensor(
+                pairs.next_latents, sample_idx, batch_size
+            ),
+            timesteps=pairs.timesteps,
+            next_timesteps=pairs.next_timesteps,
+            sigmas=pairs.sigmas,
+            next_sigmas=pairs.next_sigmas,
+            base_noise_scale=pairs.base_noise_scale,
+        )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
         rollout_debug_tensors=debug_tensors,
         denoising_env=denoising_env,
         dit_trajectory=dit_trajectory,
+        transition_pairs=transition_pairs,
     )
+
+
+def _serialize_transition_pairs(
+    pairs: RolloutTransitionPairs | None,
+) -> dict[str, Any] | None:
+    if pairs is None:
+        return None
+    return {
+        "step_indices": _maybe_serialize(pairs.step_indices),
+        "latents": _maybe_serialize(pairs.latents),
+        "next_latents": _maybe_serialize(pairs.next_latents),
+        "timesteps": _maybe_serialize(pairs.timesteps),
+        "next_timesteps": _maybe_serialize(pairs.next_timesteps),
+        "sigmas": _maybe_serialize(pairs.sigmas),
+        "next_sigmas": _maybe_serialize(pairs.next_sigmas),
+        "base_noise_scale": pairs.base_noise_scale,
+    }
 
 
 def _serialize_rollout_trajectory(
@@ -158,6 +195,7 @@ def _serialize_rollout_trajectory(
             "rollout_prev_sample_means": _maybe_serialize(rd.rollout_prev_sample_means),
             "rollout_noise_std_devs": _maybe_serialize(rd.rollout_noise_std_devs),
             "rollout_model_outputs": _maybe_serialize(rd.rollout_model_outputs),
+            "step_indices": _maybe_serialize(rd.step_indices),
         }
     serialized_denoising_env = None
     if rtd.denoising_env:
@@ -254,6 +292,11 @@ def _build_response(
             serialized_dit_timesteps=serialized_dit_timesteps,
             serialized_dit_sigmas=serialized_dit_sigmas,
         )
+        serialized_transition_pairs = _serialize_transition_pairs(
+            per_sample_trajectory.transition_pairs
+            if per_sample_trajectory is not None
+            else None
+        )
         responses.append(
             RolloutResponse(
                 request_id=request_id,
@@ -264,6 +307,7 @@ def _build_response(
                 rollout_debug_tensors=serialized_debug_tensors,
                 denoising_env=serialized_denoising_env,
                 dit_trajectory=serialized_dit_trajectory,
+                transition_pairs=serialized_transition_pairs,
                 inference_time_s=inference_time_s,
                 peak_memory_mb=peak_memory_mb,
             )
@@ -293,6 +337,7 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
+        rollout_return_transition_pairs=request.rollout_return_transition_pairs,
         rollout_sde_step_indices=request.rollout_sde_step_indices,
         rollout_return_step_indices=request.rollout_return_step_indices,
         suppress_logs=request.suppress_logs,

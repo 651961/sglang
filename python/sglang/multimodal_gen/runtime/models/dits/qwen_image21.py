@@ -31,6 +31,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     can_use_qknorm_complex_rope,
     qknorm_complex_rope,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
@@ -788,8 +789,24 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
 
     def post_load_weights(self):
         super().post_load_weights()
+        self._load_qwen_image21_pdd()
         for block in self.transformer_blocks:
             block.attn.pack_qkv_weights()
+
+    def prepare_weights_before_quantization(self):
+        self._load_qwen_image21_pdd()
+
+    def _load_qwen_image21_pdd(self):
+        pdd_path = envs.SGLANG_DIFFUSION_QWEN_IMAGE21_PDD_LORA
+        if not pdd_path or getattr(self, "_qwen21_pdd_loaded", False):
+            return
+        # The PDD bundle contains unsharded full LoRA matrices and must be
+        # installed after the base checkpoint has been materialized.
+        from sglang.multimodal_gen.runtime.models.dits.qwen_image21_pdd import (
+            load_qwen_image21_pdd,
+        )
+
+        load_qwen_image21_pdd(self, pdd_path)
 
     def prepare_modulation(self, temb):
         # All blocks share these gates. Preserve the native tanh and its dtype,

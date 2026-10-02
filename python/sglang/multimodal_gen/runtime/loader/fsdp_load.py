@@ -482,6 +482,11 @@ def maybe_load_fsdp_model(
         # move to device to perform postprocessing
         _move_to_device_preserving_meta(model, weight_postprocess_device)
 
+    prepare_weights_before_quantization = getattr(
+        model, "prepare_weights_before_quantization", None
+    )
+    if prepare_weights_before_quantization is not None:
+        prepare_weights_before_quantization()
     process_model_weights_after_loading(model)
     model.post_load_weights()
 

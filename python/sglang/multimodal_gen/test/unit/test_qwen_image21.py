@@ -40,6 +40,9 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
 )
+from sglang.multimodal_gen.runtime.models.schedulers.qwen_image21_pdd import (
+    QwenImage21PDDScheduler,
+)
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
     QwenImage21RMS_norm,
@@ -56,6 +59,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
     QwenImage21InputValidationStage,
     collapse_image_slots,
 )
+
+
+def test_qwen_image21_pdd_scheduler_uses_exported_sigma_grid():
+    pdd_sigmas = [1.0, 0.9169867, 0.7861579, 0.5494910, 0.0]
+    scheduler = QwenImage21PDDScheduler(pdd_sigmas=pdd_sigmas)
+
+    scheduler.set_timesteps(sigmas=pdd_sigmas[:-1], device="cpu")
+
+    torch.testing.assert_close(
+        scheduler.timesteps,
+        torch.tensor(pdd_sigmas[:-1]) * 1000,
+    )
+    torch.testing.assert_close(scheduler.sigmas, torch.tensor(pdd_sigmas))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

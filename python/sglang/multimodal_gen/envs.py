@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
+    SGLANG_DIFFUSION_QWEN_IMAGE21_PDD_LORA: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
@@ -334,6 +335,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PDD-distilled checkpoint; an ordinary run leaves the projection alone.
     "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
         "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
+    ),
+    # Path to a Qwen-Image 2.1 PDD bundle.
+    "SGLANG_DIFFUSION_QWEN_IMAGE21_PDD_LORA": _lazy_str(
+        "SGLANG_DIFFUSION_QWEN_IMAGE21_PDD_LORA"
     ),
     # NATTEN backend of the FLUX 3 video VAE (blackwell-fna, hopper-fna,
     # cutlass-fna or flex-fna); probed per GPU when unset.

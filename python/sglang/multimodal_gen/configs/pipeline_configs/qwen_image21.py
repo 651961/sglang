@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import QwenImage21DitConfig
@@ -26,12 +27,34 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
     vae_config: QwenImage21VAEConfig = field(default_factory=QwenImage21VAEConfig)
     text_encoder_configs: tuple = field(default_factory=lambda: (Qwen3VLConfig(),))
     text_encoder_precisions: tuple[str, ...] = ("bf16",)
+    # Populated from pdd_config.json by QwenImage21Pipeline.
+    pdd_sigmas: tuple[float, ...] | None = field(default=None, init=False, repr=False)
 
     def supports_dynamic_batching(self):
         # the scheduler excludes reference-image requests from cross-request merging
         return True
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
+        if self.pdd_sigmas is not None:
+            expected_steps = len(self.pdd_sigmas) - 1
+            if num_inference_steps < 1 or num_inference_steps > expected_steps:
+                raise ValueError(
+                    "Qwen-Image 2.1 PDD requires "
+                    f"num_inference_steps={expected_steps} (shorter schedules are "
+                    f"reserved for warmup), got {num_inference_steps}"
+                )
+            # TimestepPreparationStage passes this array to set_timesteps as
+            # the per-step schedule (without a terminal value).  The Qwen PDD
+            # scheduler appends the matching next sigma itself.
+            selected = self.pdd_sigmas[:num_inference_steps]
+            if sigmas is not None and (
+                len(sigmas) != len(selected) or not np.allclose(sigmas, selected)
+            ):
+                raise ValueError("The requested sigma schedule does not match Qwen PDD")
+            # These values are already resolution-dependent and shifted by the
+            # PDD conversion. Passing them as explicit sigmas avoids shifting
+            # the schedule a second time in the FlowMatch scheduler.
+            return np.asarray(selected, dtype=np.float32)
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
     def get_classifier_free_guidance_scale(self, batch, guidance_scale):

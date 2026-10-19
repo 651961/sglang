@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_replica
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_REFERENCE_RESIZE_MODES,
+    MINIMAX_H3_REFERENCE_VIDEO_COMPRESSION_PROFILES,
     MINIMAX_H3_SUPPORTED_FPS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
@@ -731,6 +732,14 @@ def minimax_h3_encode_reference_video_rows(
     return rows.to(torch.float32), latent_t, latent_h, latent_w
 
 
+def minimax_h3_reference_video_frame_indices(
+    *, latent_t: int, compression: str
+) -> list[int]:
+    """Select Spark-VPack phases without changing the original time grid."""
+    phases = MINIMAX_H3_REFERENCE_VIDEO_COMPRESSION_PROFILES[compression]
+    return [index for index in range(latent_t) if index % 5 in phases]
+
+
 MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = 2.0
 MINIMAX_H3_QWEN_TEMPORAL_PATCH = 2
 
@@ -972,6 +981,7 @@ __all__ = [
     "minimax_h3_encode_reference_video_rows",
     "minimax_h3_prepared_reference_image",
     "minimax_h3_prepared_reference_videos",
+    "minimax_h3_reference_video_frame_indices",
     "minimax_h3_resolve_reference_image_shape",
     "minimax_h3_sample_reference_video_frames",
 ]

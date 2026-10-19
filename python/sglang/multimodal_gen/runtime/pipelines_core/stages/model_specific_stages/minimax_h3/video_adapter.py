@@ -195,6 +195,11 @@ class MiniMaxH3VideoModelAdapter:
         )
         if reference_resize_mode is not None:
             kwargs["reference_resize_mode"] = reference_resize_mode
+        reference_video_compression = _parse_extra_value(
+            _extra_value(request, "reference_video_compression")
+        )
+        if reference_video_compression is not None:
+            kwargs["reference_video_compression"] = reference_video_compression
         if quality is not None:
             kwargs["quality"] = quality
         return kwargs

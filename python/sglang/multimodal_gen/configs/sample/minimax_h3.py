@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_REFERENCE_RESIZE_MODES,
+    MINIMAX_H3_REFERENCE_VIDEO_COMPRESSION_PROFILES,
 )
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
@@ -52,6 +53,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         metadata={"batch_sig_exclude": True},
     )
     reference_resize_mode: str = field(default="diffusers")
+    reference_video_compression: str = "0/5"
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -67,6 +69,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "imgvid_cond_noise_aug_for_inference",
                 "audio_cond_noise_aug_for_inference",
                 "reference_resize_mode",
+                "reference_video_compression",
             }
         )
 
@@ -289,6 +292,16 @@ class MiniMaxH3SamplingParams(SamplingParams):
             raise ValueError(
                 "reference_resize_mode must be one of {'match', 'max', 'diffusers'}, "
                 f"got {self.reference_resize_mode!r}"
+            )
+        if (
+            not isinstance(self.reference_video_compression, str)
+            or self.reference_video_compression
+            not in MINIMAX_H3_REFERENCE_VIDEO_COMPRESSION_PROFILES
+        ):
+            raise ValueError(
+                "reference_video_compression must be one of "
+                f"{tuple(MINIMAX_H3_REFERENCE_VIDEO_COMPRESSION_PROFILES)}, "
+                f"got {self.reference_video_compression!r}"
             )
 
     def build_request_extra(self, *, _seed_override: int | None = None) -> dict:

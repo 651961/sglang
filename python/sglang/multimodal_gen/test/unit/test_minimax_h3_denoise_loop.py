@@ -269,6 +269,44 @@ def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():
         )
 
 
+def test_cube_metadata_accepts_compressed_reference_video():
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=3,
+        latent_t=2,
+        latent_h=8,
+        latent_w=8,
+        audio_t=3,
+        ref_blocks=[
+            {
+                "kind": "video_audio",
+                "ref_audio_t": 3,
+                "latent_t": 5,
+                "latent_h": 8,
+                "latent_w": 8,
+                "dense_latent_t": 7,
+                "dense_indices": [0, 1, 3, 5, 6],
+            }
+        ],
+    )
+    metadata = _build_cube_attn_metadata(
+        SimpleNamespace(
+            attention_backend="cube_sparse_attn",
+            component_attention_backends={},
+            attention_backend_config={
+                "local_cube_size": [4, 4, 4],
+                "topk_ratio_list": [0.5],
+            },
+        ),
+        packed=packed,
+        num_steps=1,
+        device=torch.device("cpu"),
+    )
+    layout = metadata.precomputed.layout
+    used = int(packed["cu_seqlens"][1])
+    real_positions = layout.gather_indices[layout.is_real.bool()]
+    torch.testing.assert_close(real_positions.sort().values, torch.arange(used))
+
+
 def test_cube_metadata_follows_transformer_backend_override():
     packed = minimax_h3_packed_sequence(
         text_len=3,

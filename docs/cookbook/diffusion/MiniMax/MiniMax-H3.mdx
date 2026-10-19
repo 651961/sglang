@@ -684,6 +684,30 @@ affects Ref2VA image references, not FL2VA keyframes, video, or audio references
 Changing it changes the conditioning input, so keep it fixed for quality and
 performance comparisons; the server does not infer it from the adapter name.
 
+Set `reference_video_compression` to `"2/5"` to enable Spark-VPack-style
+compression of Ref2VA video and video-audio references. The default `"0/5"`
+disables compression. Accepted profiles are `"0/5"`, `"1/5"`, `"2/5"`, and
+`"3/5"`; they retain latent phases `(0,1,2,3,4)`, `(0,1,2,3)`, `(0,1,3)`, and
+`(0,3)` within each five-frame group, respectively. Partial groups retain only
+the phases that exist.
+
+For example, add this field to a request containing video references:
+
+```json
+{
+  "reference_video_compression": "2/5"
+}
+```
+
+Compression selects reference latent frames after VAE encoding and preserves
+their original RoPE time coordinates and the temporal origin of later streams.
+With `"2/5"`, a reference encoded from 124 frames goes from 37 to 23 latent
+time frames. Reference audio, Qwen frame sampling, image references, FL2VA
+keyframes, and the generated video's frame count and frame rate are unchanged.
+VAE encoding work is unchanged; the shorter reference sequence reduces DiT
+work. Compression changes conditioning and can affect quality, so compare
+outputs and latency on your workload.
+
 ```bash Command
 curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   -H "Content-Type: application/json" \

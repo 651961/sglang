@@ -161,7 +161,7 @@ def _validate_keyframe_payload(plan: Any, keyframe: Any) -> None:
 
 def _imgvid_condition_shapes(
     *,
-    ref2va_blocks: list[dict[str, int | str]] | None,
+    ref2va_blocks: list[dict[str, Any]] | None,
     keyframe: Any,
     is_ref2va: bool,
 ) -> list[tuple[int, int, int]]:
@@ -253,8 +253,8 @@ def _ref2va_ordered_blocks_and_rows(
     ref_image: Any,
     ref_audio: Any,
     ref_video: Any,
-) -> tuple[list[dict[str, int | str]], torch.Tensor | None, torch.Tensor | None]:
-    blocks: list[dict[str, int | str]] = []
+) -> tuple[list[dict[str, Any]], torch.Tensor | None, torch.Tensor | None]:
+    blocks: list[dict[str, Any]] = []
     visual_rows: list[torch.Tensor] = []
     audio_rows: list[torch.Tensor] = []
     for material in plan.materials:
@@ -316,6 +316,9 @@ def _ref2va_ordered_blocks_and_rows(
                 }
             )
             visual_rows.append(video_entry["rows"])
+            if "dense_indices" in video_entry:
+                blocks[-1]["dense_indices"] = video_entry["dense_indices"]
+                blocks[-1]["dense_latent_t"] = video_entry["dense_latent_t"]
             if ref_audio_t > 0:
                 audio_rows.append(audio_entry["rows"])
         else:

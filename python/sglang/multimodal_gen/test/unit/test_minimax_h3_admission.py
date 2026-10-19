@@ -341,6 +341,42 @@ def test_video_adapter_lowers_only_native_fields_and_rejects_cfg():
         )
 
 
+@pytest.mark.parametrize("compression", ["0/5", "1/5", "2/5", "3/5"])
+def test_reference_video_compression_request_lowering(compression):
+    assert (
+        "reference_video_compression"
+        in MiniMaxH3SamplingParams.video_request_extra_fields()
+    )
+    request = VideoGenerationsRequest(
+        prompt="contract",
+        task="ref2va",
+        target=TARGET,
+        conditions=[{"type": "video", "uri": "file:///ref.mp4", "role": "reference"}],
+        reference_video_compression=compression,
+        seed=42,
+    )
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request, {"prompt": request.prompt, "seed": request.seed}
+    )
+    params = MiniMaxH3SamplingParams(**lowered)
+    assert params.reference_video_compression == compression
+
+
+def test_reference_video_compression_defaults_to_disabled():
+    request = VideoGenerationsRequest(prompt="contract", task="t2va", target=TARGET)
+    lowered = MiniMaxH3SamplingParams.lower_video_request_kwargs(
+        request, {"prompt": request.prompt, "seed": request.seed}
+    )
+    assert "reference_video_compression" not in lowered
+    assert MiniMaxH3SamplingParams().reference_video_compression == "0/5"
+
+
+@pytest.mark.parametrize("compression", ["", "4/5", "2/3", None, True, 2, [], {}])
+def test_reference_video_compression_rejects_invalid_profiles(compression):
+    with pytest.raises(ValueError, match="reference_video_compression"):
+        MiniMaxH3SamplingParams(reference_video_compression=compression)
+
+
 def test_reference_resize_mode_is_declared_as_video_request_extra():
     assert (
         "reference_resize_mode" in MiniMaxH3SamplingParams.video_request_extra_fields()

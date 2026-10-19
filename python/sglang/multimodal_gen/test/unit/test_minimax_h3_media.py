@@ -20,6 +20,123 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     material_io,
     reference_encoding,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    _ref2va_ordered_blocks_and_rows,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.visual_encoding import (
+    MiniMaxH3VisualEncodingStage,
+)
+
+
+@pytest.mark.parametrize(
+    ("compression", "expected"),
+    [
+        ("0/5", [0, 1, 2, 3, 4, 5, 6]),
+        ("1/5", [0, 1, 2, 3, 5, 6]),
+        ("2/5", [0, 1, 3, 5, 6]),
+        ("3/5", [0, 3, 5]),
+    ],
+)
+def test_reference_video_compression_profiles(compression, expected):
+    assert (
+        reference_encoding.minimax_h3_reference_video_frame_indices(
+            latent_t=7, compression=compression
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("compression", ["0/5", "2/5"])
+@pytest.mark.parametrize("latent_t", [2, 37])
+def test_reference_video_compression_preserves_rows_and_time_mapping(
+    monkeypatch, compression, latent_t
+):
+    rows = torch.arange(latent_t * 4 * 96, dtype=torch.float32).reshape(-1, 96)
+    videos = [
+        {
+            "frames": object(),
+            "condition_index": index,
+            "material_chain": chain,
+        }
+        for index, chain in enumerate(
+            ("video.reference_preserve", "video_audio.reference_preserve")
+        )
+    ]
+    monkeypatch.setattr(
+        reference_encoding,
+        "minimax_h3_prepared_reference_videos",
+        lambda *_args, **_kwargs: {"videos": videos},
+    )
+    monkeypatch.setattr(
+        reference_encoding,
+        "minimax_h3_encode_reference_video_rows",
+        lambda *_args: (rows, latent_t, 4, 4),
+    )
+    stage = MiniMaxH3VisualEncodingStage(
+        video_vae=SimpleNamespace(parallel_tiling=False), vae_arch_config=None
+    )
+    batch = SimpleNamespace(
+        extra={},
+        sampling_params=SimpleNamespace(reference_video_compression=compression),
+    )
+    plan = SimpleNamespace(materials=[SimpleNamespace(**item) for item in videos])
+    stage._encode_reference_video(batch, plan)
+    payload = batch.extra[MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY]
+    audio_rows = torch.ones(6, 32)
+    audio_payload = {
+        "audios": [
+            {"condition_index": index, "ref_audio_t": 3, "rows": audio_rows}
+            for index in range(2)
+        ]
+    }
+    blocks, visual, audio = _ref2va_ordered_blocks_and_rows(
+        plan=plan, ref_image=None, ref_audio=audio_payload, ref_video=payload
+    )
+    indices = list(range(latent_t))
+    if compression == "2/5" and latent_t == 37:
+        indices = [
+            0,
+            1,
+            3,
+            5,
+            6,
+            8,
+            10,
+            11,
+            13,
+            15,
+            16,
+            18,
+            20,
+            21,
+            23,
+            25,
+            26,
+            28,
+            30,
+            31,
+            33,
+            35,
+            36,
+        ]
+    expected = rows.reshape(latent_t, 4, 96)[indices].reshape(-1, 96)
+    torch.testing.assert_close(visual, torch.cat([expected, expected]), rtol=0, atol=0)
+    torch.testing.assert_close(
+        audio, torch.cat([audio_rows, audio_rows]), rtol=0, atol=0
+    )
+    for entry, block in zip(payload["videos"], blocks):
+        assert entry["latent_t"] == block["latent_t"] == len(indices)
+        if compression == "0/5":
+            assert entry["rows"] is rows
+            assert "dense_indices" not in entry
+            assert "dense_latent_t" not in block
+        else:
+            assert entry["dense_indices"] == block["dense_indices"] == indices
+            assert entry["dense_latent_t"] == block["dense_latent_t"] == latent_t
+    assert all("frames" not in item for item in videos)
 
 
 @pytest.mark.parametrize(

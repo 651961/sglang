@@ -313,6 +313,9 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     - ``{"kind": "video"|"video_audio", "ref_audio_t": T,
        "latent_t": RT, "latent_h": RH, "latent_w": RW}``
 
+    Compressed reference videos also carry ``dense_latent_t`` and strictly
+    increasing ``dense_indices`` to preserve their original temporal positions.
+
     Optional first/last keyframes are packed immediately after text, matching
     Comfy's hybrid Ref2VA + guide layout. Video-bearing blocks pack their audio
     rows immediately before their video rows; both share the same temporal
@@ -362,6 +365,24 @@ def minimax_h3_packed_sequence_ref2va_blocks(
                 "audio_rows": audio_rows,
                 "video_rows": video_rows,
             }
+            if "dense_indices" in raw or "dense_latent_t" in raw:
+                dense_t = _positive_int(raw, "dense_latent_t", path)
+                indices = raw.get("dense_indices")
+                if (
+                    not isinstance(indices, (list, tuple))
+                    or len(indices) != vt
+                    or any(
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or not 0 <= index < dense_t
+                        for index in indices
+                    )
+                    or any(a >= b for a, b in zip(indices, indices[1:]))
+                ):
+                    raise ValueError(
+                        f"{path}.dense_indices is not a valid time mapping"
+                    )
+                item.update(dense_latent_t=dense_t, dense_indices=indices)
             ref_audio_rows += audio_rows
             ref_visual_rows += video_rows
         else:
@@ -492,9 +513,13 @@ def minimax_h3_packed_sequence_ref2va_blocks(
 
             rv_frame = torch.stack([rv_hh.reshape(-1), rv_ww.reshape(-1)], dim=-1)
             rv_g = g[visual_sl].view(vt, int(item["frame_rows"]), 3)
-            rv_g[:, :, 0] = _video_t_grid(vt, t_cursor)[:, None]
+            dense_t = int(item.get("dense_latent_t", vt))
+            time_grid = _video_t_grid(dense_t, t_cursor)
+            if "dense_indices" in item:
+                time_grid = time_grid[list(item["dense_indices"])]
+            rv_g[:, :, 0] = time_grid[:, None]
             rv_g[:, :, 1:] = rv_frame[None]
-            t_cursor += max(float(ref_t), _video_t_span(vt))
+            t_cursor += max(float(ref_t), _video_t_span(dense_t))
 
     audio_t_grid = t_cursor + torch.arange(audio_t, dtype=torch.float64)
     g[audio_sl, 0] = audio_t_grid.repeat(audio_channel)

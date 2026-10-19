@@ -27,6 +27,13 @@ MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY = "minimax_h3_reference_video_rows"
 MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY = "minimax_h3_prepared_reference_video"
 
 MINIMAX_H3_SUPPORTED_FPS = 24
+# Spark-VPack phases retained within each five-frame VAE latent group.
+MINIMAX_H3_REFERENCE_VIDEO_COMPRESSION_PROFILES = {
+    "0/5": (0, 1, 2, 3, 4),
+    "1/5": (0, 1, 2, 3),
+    "2/5": (0, 1, 3),
+    "3/5": (0, 3),
+}
 MINIMAX_H3_MIN_DURATION_SECONDS = 4.0
 MINIMAX_H3_MAX_DURATION_SECONDS = 15.0
 

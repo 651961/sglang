@@ -282,6 +282,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
             minimax_h3_encode_reference_video_rows,
             minimax_h3_prepared_reference_videos,
+            minimax_h3_reference_video_frame_indices,
         )
 
         if MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY in batch.extra:
@@ -298,22 +299,36 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
                 f"'videos' list, got {videos!r}"
             )
         entries = []
+        compression = getattr(
+            batch.sampling_params, "reference_video_compression", "0/5"
+        )
         for item in videos:
             rows, latent_t, latent_h, latent_w = minimax_h3_encode_reference_video_rows(
                 self.video_vae,
                 item["frames"],
                 self.vae_arch_config,
             )
-            entries.append(
-                {
-                    "rows": rows,
-                    "latent_t": latent_t,
-                    "latent_h": latent_h,
-                    "latent_w": latent_w,
-                    "condition_index": int(item["condition_index"]),
-                    "material_chain": str(item["material_chain"]),
-                }
-            )
+            entry = {
+                "rows": rows,
+                "latent_t": latent_t,
+                "latent_h": latent_h,
+                "latent_w": latent_w,
+                "condition_index": int(item["condition_index"]),
+                "material_chain": str(item["material_chain"]),
+            }
+            if compression != "0/5":
+                indices = minimax_h3_reference_video_frame_indices(
+                    latent_t=latent_t, compression=compression
+                )
+                entry.update(
+                    rows=rows.reshape(latent_t, -1, rows.shape[-1])[indices].reshape(
+                        -1, rows.shape[-1]
+                    ),
+                    latent_t=len(indices),
+                    dense_latent_t=latent_t,
+                    dense_indices=indices,
+                )
+            entries.append(entry)
         for item in videos:
             # Text and visual encoding are the only RGB-frame consumers. Drop
             # the large request-local arrays as soon as both have completed.

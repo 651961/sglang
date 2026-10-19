@@ -3,6 +3,9 @@
 
 import unittest
 
+import pytest
+import torch
+
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     trailing_padding_used_len,
 )
@@ -10,6 +13,114 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
+
+
+@pytest.mark.parametrize("ref_audio_t", [0, 3, 400])
+def test_compressed_reference_video_preserves_dense_positions(ref_audio_t):
+    common = dict(
+        text_len=5,
+        latent_t=2,
+        latent_h=4,
+        latent_w=4,
+        audio_t=5,
+        keyframe_frame_indices=[0, -1],
+        frame_count=5,
+        include_video_pos=True,
+    )
+    refs = [
+        {"kind": "image", "latent_h": 4, "latent_w": 4},
+        {
+            "kind": "video",
+            "latent_t": 7,
+            "latent_h": 4,
+            "latent_w": 4,
+            "ref_audio_t": ref_audio_t,
+        },
+        {"kind": "audio", "ref_audio_t": 2},
+        {
+            "kind": "video_audio",
+            "latent_t": 7,
+            "latent_h": 4,
+            "latent_w": 4,
+            "ref_audio_t": ref_audio_t,
+        },
+    ]
+    dense = minimax_h3_packed_sequence_ref2va_blocks(**common, ref_blocks=refs)
+    indices = (0, 1, 3, 5, 6)
+    compressed_refs = [
+        {**ref, "latent_t": 5, "dense_latent_t": 7, "dense_indices": indices}
+        if ref["kind"] in ("video", "video_audio")
+        else ref
+        for ref in refs
+    ]
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        **common, ref_blocks=compressed_refs
+    )
+    # Two keyframes, one image, two reference videos, then the target video.
+    dense_visual = dense["img_position_ids"][dense["img_pos"]]
+    expected = torch.cat(
+        [
+            dense_visual[:12],
+            dense_visual[12:40].reshape(7, 4, 3)[list(indices)].reshape(-1, 3),
+            dense_visual[40:68].reshape(7, 4, 3)[list(indices)].reshape(-1, 3),
+            dense_visual[68:],
+        ]
+    )
+    torch.testing.assert_close(
+        packed["img_position_ids"][packed["img_pos"]], expected, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        packed["img_position_ids"][packed["audio_pos"]],
+        dense["img_position_ids"][dense["audio_pos"]],
+        rtol=0,
+        atol=0,
+    )
+    assert packed["update_mask"].sum() == dense["update_mask"].sum() == 8
+    assert packed["audio_update_mask"].sum() == dense["audio_update_mask"].sum() == 10
+    assert packed["img_pos"].numel() == dense["img_pos"].numel() - 16
+    assert packed["seq_len"] % 64 == 0
+    assert packed["cu_seqlens"][1] == dense["cu_seqlens"][1] - 16
+    assert packed["video_pos"].numel() == 48  # References and target, excluding images.
+    assert packed["stream_layout"]["cond_image_shapes"] == (
+        (1, 2, 2),
+        (5, 2, 2),
+        (5, 2, 2),
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"dense_latent_t": 7},
+        {"dense_indices": [0, 3]},
+        {"dense_latent_t": 7, "dense_indices": [0]},
+        {"dense_latent_t": 7, "dense_indices": [0, 7]},
+        {"dense_latent_t": 7, "dense_indices": [-1, 3]},
+        {"dense_latent_t": 7, "dense_indices": [3, 0]},
+        {"dense_latent_t": 7, "dense_indices": [0, 0]},
+        {"dense_latent_t": 7, "dense_indices": [False, 3]},
+        {"dense_latent_t": 7, "dense_indices": [0.0, 3]},
+    ],
+)
+def test_compressed_reference_video_rejects_invalid_time_mapping(metadata):
+    with pytest.raises(ValueError, match="dense_"):
+        minimax_h3_packed_sequence_ref2va_blocks(
+            text_len=5,
+            latent_t=2,
+            latent_h=4,
+            latent_w=4,
+            audio_t=5,
+            ref_blocks=[
+                {
+                    "kind": "video",
+                    "ref_audio_t": 0,
+                    "latent_t": 2,
+                    "latent_h": 4,
+                    "latent_w": 4,
+                    **metadata,
+                }
+            ],
+        )
 
 
 class TestMiniMaxH3PackedSequence(unittest.TestCase):

@@ -423,6 +423,26 @@ class _SolAttnBackendResolver(_CudaAttentionBackendResolver):
             ) from e
 
 
+class _SparkAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SPARK_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        if capability not in {(8, 0), (8, 6), (8, 9), (12, 0)}:
+            raise ValueError("Spark attention requires SM80, SM86, SM89, or SM120")
+        try:
+            from h3_sparse_attention.spark_integration import (  # noqa: F401
+                spark_attention_bthd,
+            )
+        except ImportError as error:
+            raise ImportError(
+                "Spark attention requires Spark-H3. Install its optional CUDA "
+                "package with `pip install '/path/to/Spark-H3[cuda]'`."
+            ) from error
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.spark_attn.SparkAttentionBackend"
+
+
 class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VMOBA_ATTN
 
@@ -578,6 +598,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
+        _SparkAttentionBackendResolver,
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,

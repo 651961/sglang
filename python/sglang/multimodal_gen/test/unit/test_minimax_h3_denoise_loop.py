@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
     MiniMaxH3DenoisingStage,
-    _build_cube_attn_metadata,
+    _build_h3_attn_metadata,
     _precompute_refined_prompt_embeds,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
@@ -251,7 +251,7 @@ def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():
         },
     )
 
-    metadata = _build_cube_attn_metadata(
+    metadata = _build_h3_attn_metadata(
         server_args,
         packed=packed,
         num_steps=2,
@@ -261,7 +261,7 @@ def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():
     assert metadata.precomputed.layout.cube_token_size == 64
 
     with pytest.raises(ValueError, match="denoise steps"):
-        _build_cube_attn_metadata(
+        _build_h3_attn_metadata(
             server_args,
             packed=packed,
             num_steps=3,
@@ -288,7 +288,7 @@ def test_cube_metadata_accepts_compressed_reference_video():
             }
         ],
     )
-    metadata = _build_cube_attn_metadata(
+    metadata = _build_h3_attn_metadata(
         SimpleNamespace(
             attention_backend="cube_sparse_attn",
             component_attention_backends={},
@@ -325,7 +325,7 @@ def test_cube_metadata_follows_transformer_backend_override():
         },
     )
     assert (
-        _build_cube_attn_metadata(
+        _build_h3_attn_metadata(
             server_args,
             packed=packed,
             num_steps=1,
@@ -337,7 +337,7 @@ def test_cube_metadata_follows_transformer_backend_override():
     server_args.attention_backend = "cube_sparse_attn"
     server_args.component_attention_backends["transformer"] = "fa"
     assert (
-        _build_cube_attn_metadata(
+        _build_h3_attn_metadata(
             server_args,
             packed=packed,
             num_steps=1,

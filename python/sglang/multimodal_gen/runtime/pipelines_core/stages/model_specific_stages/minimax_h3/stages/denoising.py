@@ -16,8 +16,10 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionMetadata,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
-    CubeSparseAttentionMetadata,
     CubeSparseAttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
@@ -345,17 +347,27 @@ def _resolve_denoise_model(
     return model.to(device).eval()
 
 
-def _build_cube_attn_metadata(
+def _build_h3_attn_metadata(
     server_args: ServerArgs,
     *,
     packed: dict[str, Any],
     num_steps: int,
     device: torch.device,
-) -> CubeSparseAttentionMetadata | None:
-    """Build cube sparse attention metadata when that backend is selected."""
+) -> AttentionMetadata | None:
+    """Build request-static sparse metadata for the selected H3 backend."""
     transformer_backend = (server_args.component_attention_backends or {}).get(
         "transformer", server_args.attention_backend
     )
+    if str(transformer_backend).lower() == "spark_attn":
+        from sglang.multimodal_gen.runtime.layers.attention.backends.spark_attn import (
+            SparkAttentionMetadataBuilder,
+        )
+
+        return SparkAttentionMetadataBuilder().build(
+            packed=packed,
+            num_steps=num_steps,
+            device=device,
+        )
     if str(transformer_backend).lower() != "cube_sparse_attn":
         return None
 
@@ -731,7 +743,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
         )
-        attn_metadata = _build_cube_attn_metadata(
+        attn_metadata = _build_h3_attn_metadata(
             server_args,
             packed=packed,
             num_steps=len(sigmas_video) - 1,
@@ -902,7 +914,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
-        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        attn_metadata: AttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""

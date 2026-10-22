@@ -1359,6 +1359,35 @@ def test_comfyui_sparse_stream_layout_preserves_target_and_condition_roles():
     assert stream["cond_event_orders"] == (("imgvid", 0),)
 
 
+def test_comfyui_spark_joint_video_matches_native_reference_roles():
+    from sglang.multimodal_gen.runtime.layers.attention.backends.spark_attn import (
+        SparkAttentionMetadataBuilder,
+    )
+
+    common = dict(text_len=3, latent_t=2, latent_h=8, latent_w=12, audio_t=4)
+    refs = [
+        dict(kind="image", latent_h=4, latent_w=4),
+        dict(kind="video_audio", ref_audio_t=3, latent_t=3, latent_h=4, latent_w=4),
+    ]
+    keyframe = {"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 8, 12)}
+    layout = ComfyUIPackedLayout(**common, refs=refs, keyframes=[keyframe])
+    comfy = comfyui_layout_to_packed(serialize_comfyui_layout(layout))
+    native = minimax_h3_packed_sequence_ref2va_blocks(
+        **common,
+        ref_blocks=refs,
+        keyframe_frame_indices=[0],
+        frame_count=5,
+    )
+    builder = SparkAttentionMetadataBuilder()
+    expected, actual = (
+        builder.build(packed=packed, num_steps=19, device=torch.device("cpu"))
+        for packed in (native, comfy)
+    )
+    assert actual.video_tokens == 60
+    assert torch.equal(actual.permutation, expected.permutation)
+    torch.testing.assert_close(actual.video_positions, expected.video_positions)
+
+
 @pytest.mark.parametrize("model_type", ["fast_h3", "vdn_h3"])
 def test_distilled_h3_rejects_wrong_grid_and_reference_task(model_type):
     expected = distilled_h3_sigmas(model_type)

@@ -646,20 +646,20 @@ def _step_attn_metadata(
         prepare_hybrid_attention_metadata,
     )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-        _build_cube_attn_metadata,
+        _build_h3_attn_metadata,
         _maybe_prepare_vsa_h3_step_metadata,
     )
 
     packed = inputs["packed"]
     latent_shape = tuple(inputs["padded_video_shape"][-3:])
-    cube = _build_cube_attn_metadata(
+    metadata = _build_h3_attn_metadata(
         server_args,
         packed=packed,
         num_steps=max((_sample_sigmas_len(sample_sigmas) or 2) - 1, 1),
         device=device,
     )
-    if cube is not None:
-        return lambda _step: cube
+    if metadata is not None:
+        return lambda _step: metadata
     # VSA-H3 tiles assume the native row order (text, cond, audio, raster video);
     # test_vsa_h3_tiles_cover_comfyui_packed_rows pins ComfyUI layouts to it.
     build = _maybe_prepare_vsa_h3_step_metadata(

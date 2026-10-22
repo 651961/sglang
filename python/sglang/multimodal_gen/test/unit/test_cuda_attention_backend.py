@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.platforms.cuda import (
     CudaPlatformBase,
     _SageAttentionBackendResolver,
     _SpargeAttentionBackendResolver,
+    _SparkAttentionBackendResolver,
 )
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
@@ -98,6 +99,29 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             "sglang.multimodal_gen.runtime.layers.attention.backends."
             "cube_sparse_attn.CubeSparseAttentionBackend",
         )
+
+    def test_spark_selection_loads_optional_backend(self):
+        module_name = "h3_sparse_attention.spark_integration"
+        module = ModuleType(module_name)
+        module.spark_attention_bthd = Mock()
+        with patch.dict(sys.modules, {module_name: module}):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.SPARK_ATTN, torch.bfloat16),
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "spark_attn.SparkAttentionBackend",
+            )
+
+    def test_spark_rejects_unvalidated_architectures(self):
+        for capability in ((7, 5), (9, 0), (10, 0), (10, 3)):
+            with self.subTest(capability=capability):
+                FakeCudaPlatform.device_capability = DeviceCapability(*capability)
+                with self.assertRaisesRegex(ValueError, "requires SM80"):
+                    _SparkAttentionBackendResolver.resolve(FakeCudaPlatform)
+
+    def test_spark_missing_dependency_has_install_instruction(self):
+        with patch.dict(sys.modules, {"h3_sparse_attention.spark_integration": None}):
+            with self.assertRaisesRegex(ImportError, "Spark-H3\\[cuda\\]"):
+                _SparkAttentionBackendResolver.resolve(FakeCudaPlatform)
 
     def test_blackwell_cube_selection_initializes_fa4_for_token_refiner(self):
         FakeCudaPlatform.is_blackwell_device = True

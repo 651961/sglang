@@ -1378,6 +1378,65 @@ fails closed when the selected format, projection, or topology is incompatible.
 
 </Tab>
 
+<Tab title="Spark joint-video attention">
+
+Spark-H3 is an optional, training-free backend for native H3 T2VA, FL2VA, and
+Ref2VA. It combines similarity-based Reblock, Top-K exact attention, and
+Reweight summaries for the remaining blocks. A Top-K ratio of `0.2` selects
+20% of the candidate visual blocks for exact computation; the remaining
+blocks still contribute through the approximate branch.
+
+Install [Spark-H3](https://github.com/zechengtang/Spark-H3) in your existing
+SGLang CUDA environment. The command below preserves installed dependencies;
+it assumes the environment already provides Spark-H3's CUDA requirements
+(`triton>=3.2`, `nvidia-cutlass-dsl>=4.4`, `cuda-python>=12`, and `apache-tvm-ffi`).
+The integration uses the upstream Python
+kernels, not the ComfyUI plugin or its comfy-kitchen wheel. The tested source
+revision is `06cf711e4b5ebd519c92a84c1771560aca99f3a0`:
+
+```bash Command
+python -m pip install --no-deps /path/to/Spark-H3
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --component-attention-backends transformer=spark_attn \
+  --port 30010
+```
+
+Use `--model-variant fl2va` for FL2VA. Selecting the backend only for the
+transformer leaves auxiliary components on their existing attention backends.
+The backend requires BF16, head dimension 128, and CUDA SM80, SM86, SM89, or
+SM120. Ulysses is supported; Ring parallelism is not.
+
+The sparse scope is fixed to **joint-video**: multi-frame reference videos and
+the target video share one Reblock/Top-K/Reweight domain, including both
+reference-to-target and target-to-reference interactions. Static reference
+images, FL2VA/Ref2VA keyframes, text, reference audio, and target audio retain
+dense query rows and exact K/V. Partial visual boundary blocks also stay dense.
+Padding remains a separate document. Spark-VPack reference compression can be
+enabled independently; the retained reference frames keep their original RoPE
+coordinates when passed to Spark.
+
+Optional `--attention-backend-config` settings:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `topk_ratio` | `0.2` | Exact candidate-block ratio in `(0, 1]`. |
+| `warmup_ratio` | `0.2` | First `ceil(actual denoise calls * ratio)` calls use dense attention. Set to `0` to disable. |
+| `dense_layers` | `0` | Number of leading DiT layers that always stay dense. |
+| `min_tokens` | `12288` | Requests below this live packed-token count stay dense. |
+
+These defaults follow the ComfyUI node's fidelity preset. The approximate
+branch uses per-query processing, and Q reuses K's reblock layout. Spark changes
+attention numerics; compare output quality and latency on your workload.
+Dense warmup, short sequences, and the token refiner use PyTorch SDPA, matching
+the upstream Spark kernels' dense context-query implementation.
+
+</Tab>
+
 <Tab title="Cube sparse attention">
 
 Cube sparse attention applies TopK sparsity only to H3's 3D visual streams.

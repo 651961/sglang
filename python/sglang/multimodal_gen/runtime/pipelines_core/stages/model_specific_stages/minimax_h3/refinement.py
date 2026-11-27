@@ -25,8 +25,8 @@ def refinement_sigmas(steps, audio_shift=3.0):
     return {"video": video.tolist(), "audio": model_sigma.tolist()}
 
 
-def refinement_frames(path, keyframe, frame_count):
-    width, height = keyframe.size
+def refinement_frames(path, size, frame_count, keyframes):
+    width, height = size
     # The training cache decodes at 24 fps and scales uint8 RGB with ffmpeg.
     command = [
         "ffmpeg",
@@ -63,7 +63,8 @@ def refinement_frames(path, keyframe, frame_count):
     if whole_frames < frame_count:
         # The cache producer repeats the last frame up to the VAE boundary.
         frames[whole_frames:] = frames[whole_frames - 1]
-    frames[0] = np.asarray(keyframe.convert("RGB"))
+    for index, image in keyframes.items():
+        frames[index] = np.asarray(image.convert("RGB"))
     return frames
 
 

@@ -144,7 +144,7 @@ def _validate_keyframe_payload(plan: Any, keyframe: Any) -> None:
             )
         return
     if keyframe is None:
-        if task == "fl2va":
+        if task == "fl2va" and plan.shape.get("geometry_source") != "refinement_video":
             raise ValueError("fl2va denoising requires encoded keyframe condition rows")
         return
     if not isinstance(keyframe, Mapping):

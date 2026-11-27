@@ -312,15 +312,26 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
             probe_facts[int(material.condition_index)] = facts
         batch.extra[MINIMAX_H3_PROBE_FACTS_EXTRA_KEY] = probe_facts
 
+        shape = dict(plan.shape)
         if source := batch.extra.get("minimax_h3_refinement_video"):
             # Localize once before replica workers enter VAE tile collectives.
-            minimax_h3_probe_material(
+            source_facts = minimax_h3_probe_material(
                 batch,
                 source,
                 condition_type="video",
                 condition_index=len(plan.materials),
             )
-        shape = dict(plan.shape)
+            if not plan.materials:
+                width, height = _display_shape(source_facts, label="refinement_video")
+                shape.update(
+                    minimax_h3_resolve_spatial_shape(
+                        width=width,
+                        height=height,
+                        base_short_edge=int(shape["base_short_edge"]),
+                        refinement=True,
+                    )
+                )
+                shape["geometry_source"] = "refinement_video"
         _validate_reference_start_times(plan, probe_facts)
         _resolve_deferred_spatial_shape(
             plan,

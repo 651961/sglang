@@ -316,6 +316,7 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         "seed",
         "flow_shift",
         "audio_flow_shift",
+        "refinement_video",
     }
     for key in ("schema", "task", "prompt", "conditions", "target"):
         if key not in canonical:
@@ -335,7 +336,10 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         if isinstance(conditions, (list, tuple))
         else []
     )
-    if profile.task == "fl2va" or keyframe_conditions:
+    if (
+        profile.task == "fl2va"
+        and not (canonical.get("refinement_video") and conditions == [])
+    ) or keyframe_conditions:
         signatures = (
             [
                 (

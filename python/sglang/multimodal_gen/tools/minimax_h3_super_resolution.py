@@ -9,10 +9,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--lora-path", required=True, type=Path)
-    parser.add_argument(
-        "--image", required=True, type=Path, help="Original first frame"
-    )
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--image", type=Path, help="Optional original first frame")
+    parser.add_argument("--last-image", type=Path, help="Optional original last frame")
+    parser.add_argument("--prompt", help="Scene prompt for coarse generation")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
         "--stage1-video", type=Path, help="Reuse an existing coarse H3 MP4"
@@ -35,22 +34,25 @@ def main():
     parser.add_argument("--num-gpus", type=int, default=1)
     args = parser.parse_args()
 
+    if args.stage1_video is None and not args.prompt:
+        parser.error("--prompt is required to generate the coarse clip")
+
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     common = {
-        "task": "fl2va",
-        "prompt": args.prompt,
         "seed": args.seed,
         "conditions": [
             {
                 "type": "image",
-                "uri": str(args.image.resolve(strict=True)),
+                "uri": str(path.resolve(strict=True)),
                 "role": "keyframe",
-                "frame_index": 0,
+                "frame_index": index,
             }
+            for index, path in ((0, args.image), (-1, args.last_image))
+            if path is not None
         ],
         "save_output": True,
         "output_path": str(args.output_dir.resolve()),
@@ -86,6 +88,8 @@ def main():
             coarse = generator.generate(
                 dict(
                     **common,
+                    task="fl2va" if common["conditions"] else "t2va",
+                    prompt=args.prompt,
                     target=dict(**target, short_edge=args.stage1_short_edge),
                     num_inference_steps=args.stage1_steps,
                     output_file_name="stage1.mp4",
@@ -98,6 +102,8 @@ def main():
         result = generator.generate(
             dict(
                 **common,
+                task="fl2va",
+                prompt="Upscale the video and restore fine details while preserving the original content, colors, motion, and temporal consistency.",
                 target=dict(**target, short_edge=args.target_short_edge),
                 refinement_video=str(source.resolve(strict=True)),
                 num_inference_steps=args.refinement_steps,

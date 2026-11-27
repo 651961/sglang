@@ -320,14 +320,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 or not self.refinement_video.strip()
             ):
                 raise ValueError("refinement_video must be a non-empty video URI")
-            if (
-                self.task != "fl2va"
-                or len(self.conditions or []) != 1
-                or self.conditions[0].get("frame_index") != 0
-            ):
-                raise ValueError(
-                    "refinement_video requires FL2VA with one first-frame keyframe"
-                )
+            if self.task != "fl2va":
+                raise ValueError("refinement_video requires the FL2VA task")
             extra["minimax_h3_refinement_video"] = self.refinement_video
         if self.task is not None:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.request_validation import (
@@ -339,6 +333,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                     task=self.task,
                     prompt=self.prompt,
                     conditions=self.conditions,
+                    refinement_video=self.refinement_video,
                     target=self.target,
                     flow_shift=self.flow_shift,
                     audio_flow_shift=self.audio_flow_shift,

@@ -162,6 +162,7 @@ def _validate_conditions(
     *,
     profile: MiniMaxH3TaskProfile,
     frame_count: int | None,
+    optional: bool = False,
 ) -> list[dict[str, Any]]:
     path = "conditions"
     if conditions is None:
@@ -177,6 +178,8 @@ def _validate_conditions(
             )
         return []
     if len(conditions) == 0:
+        if optional:
+            return []
         raise ValueError(
             f"{path} requires at least one entry for task {profile.task!r}"
         )
@@ -310,6 +313,7 @@ def minimax_h3_validate_canonical_request(
     flow_shift: Any = None,
     audio_flow_shift: Any = None,
     seed: Any = None,
+    refinement_video: str | None = None,
     **_extra_kwargs: Any,
 ) -> dict[str, Any]:
     """Validate and normalize a `minimax_h3.request/v1` canonical request.
@@ -354,12 +358,17 @@ def minimax_h3_validate_canonical_request(
                 float(normalized_target["duration_seconds"]) * MINIMAX_H3_SUPPORTED_FPS
             )
         )
+    if refinement_video is not None:
+        if profile.task != MINIMAX_H3_TASK_FL2VA:
+            raise ValueError("refinement_video requires the FL2VA task")
+        _require_str(refinement_video, "refinement_video")
     normalized_conditions = _validate_conditions(
         conditions,
         profile=profile,
         frame_count=requested_frame_count,
+        optional=refinement_video is not None,
     )
-    if profile.task == MINIMAX_H3_TASK_FL2VA:
+    if profile.task == MINIMAX_H3_TASK_FL2VA and normalized_conditions:
         _validate_keyframe_conditions(normalized_conditions, task=profile.task)
     elif profile.task == MINIMAX_H3_TASK_REF2VA and any(
         condition["role"] == MINIMAX_H3_CONDITION_ROLE_KEYFRAME
@@ -403,6 +412,8 @@ def minimax_h3_validate_canonical_request(
         "conditions": normalized_conditions,
         "target": normalized_target,
     }
+    if refinement_video is not None:
+        canonical["refinement_video"] = refinement_video
     normalized_flow_shift = optional_positive_finite_float(flow_shift, "flow_shift")
     normalized_audio_flow_shift = optional_positive_finite_float(
         audio_flow_shift, "audio_flow_shift"

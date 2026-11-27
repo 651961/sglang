@@ -33,7 +33,8 @@ def test_refinement_couples_video_to_training_audio_timestep():
     assert sigmas["audio"] == pytest.approx((table[idx].float() / 1000).tolist())
 
 
-def test_refinement_replaces_only_first_resized_frame(tmp_path):
+@pytest.mark.parametrize("indices", [(), (0,), (-1,), (0, -1)])
+def test_refinement_replaces_only_supplied_frames(tmp_path, indices):
     source = tmp_path / "coarse.mkv"
     frames = np.zeros((5, 16, 16, 3), dtype=np.uint8)
     frames[..., 2] = 255
@@ -60,10 +61,16 @@ def test_refinement_replaces_only_first_resized_frame(tmp_path):
         check=True,
     )
     anchor = Image.new("RGB", (64, 32), "red")
-    result = refinement_frames(str(source), anchor, 5)
+    anchors = {
+        idx: Image.new("RGB", anchor.size, "red" if idx == 0 else "green")
+        for idx in indices
+    }
+    result = refinement_frames(str(source), anchor.size, 5, anchors)
     assert result.shape == (5, 32, 64, 3)
-    np.testing.assert_array_equal(result[0], np.asarray(anchor))
-    assert (result[1:, :, :, 2] == 255).all()
+    expected = np.full_like(result, [0, 0, 255])
+    for idx, img in anchors.items():
+        expected[idx] = np.asarray(img)
+    np.testing.assert_array_equal(result, expected)
 
 
 def test_peer_partial_fast_path_skips_lora_wrapped_output_projection():

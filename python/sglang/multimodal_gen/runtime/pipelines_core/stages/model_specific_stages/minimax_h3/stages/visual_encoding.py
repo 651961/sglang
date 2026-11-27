@@ -90,8 +90,9 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
 
         plan = minimax_h3_plan_from_batch(batch)
         if plan is not None:
-            routed = plan.encoders.get("visual")
-            if not routed:
+            routed = plan.encoders.get("visual") or []
+            source = batch.extra.get("minimax_h3_refinement_video")
+            if not routed and not source:
                 return batch
             from .replica_broadcast import (
                 minimax_h3_replica_broadcast_error,
@@ -99,8 +100,8 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
                 minimax_h3_replica_ctx,
             )
 
-            output_keys = self._visual_output_keys(plan, routed)
-            if batch.extra.get("minimax_h3_refinement_video"):
+            output_keys = self._visual_output_keys(plan, routed) if routed else ()
+            if source:
                 output_keys += (REFINEMENT_EXTRA,)
             replica_world, replica_rank = minimax_h3_replica_ctx()
             parallel_encode = replica_world > 1 and bool(self.video_vae.parallel_tiling)
@@ -221,6 +222,8 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         with minimax_h3_scoped_encode_fp32(self.video_vae):
             if keyframe_materials:
                 self._encode_target_keyframes(batch, plan)
+            elif source := batch.extra.get("minimax_h3_refinement_video"):
+                self._encode_refinement(batch, plan, source, {})
             if "image.reference_preserve" in chains:
                 self._encode_reference_image(batch, plan, server_args)
             if chains & video_chains:
@@ -253,13 +256,18 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             )
         encoded = []
         rows_list = []
+        if source := batch.extra.get("minimax_h3_refinement_video"):
+            anchors = {
+                item["frame_index"]: item["image"] for item in prepared["images"]
+            }
+            refinement_rows = self._encode_refinement(batch, plan, source, anchors)
         for item in prepared["images"]:
             image = item["image"]
             width, height = item["canvas_width"], item["canvas_height"]
             # The encode sampling seed is pinned at 42 (the VAE sample
             # seed is part of the contract), independent of the request seed.
-            if source := batch.extra.get("minimax_h3_refinement_video"):
-                rows = self._encode_refinement(batch, plan, source, image)
+            if source:
+                rows = refinement_rows[item["frame_index"]]
             else:
                 rows = minimax_h3_encode_keyframe_cond_rows(
                     self.video_vae, image, self.vae_arch_config
@@ -291,7 +299,7 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             "frame_count": prepared.get("frame_count"),
         }
 
-    def _encode_refinement(self, batch, plan, source, image):
+    def _encode_refinement(self, batch, plan, source, anchors):
         from ..material_io import minimax_h3_probe_material
         from ..refinement import (
             encode_refinement_rows,
@@ -303,16 +311,20 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             batch, source, condition_index=len(plan.materials), condition_type="video"
         )
         count = int(plan.shape["frame_count"])
-        frames = refinement_frames(facts["local_path"], image, count)
+        size = (int(plan.shape["width"]), int(plan.shape["height"]))
+        frames = refinement_frames(facts["local_path"], size, count, anchors)
         batch.extra[REFINEMENT_EXTRA] = {
             "rows": encode_refinement_rows(
                 self.video_vae, frames, self.vae_arch_config
             ),
             "waveform": refinement_audio(facts, count),
         }
-        return encode_refinement_rows(
-            self.video_vae, frames[:1], self.vae_arch_config, keyframe=True
-        )
+        return {
+            index: encode_refinement_rows(
+                self.video_vae, frames[index][None], self.vae_arch_config, keyframe=True
+            )
+            for index in anchors
+        }
 
     @use_gpu_conditioning_hash()
     def _encode_reference_video(self, batch: Req, plan) -> None:

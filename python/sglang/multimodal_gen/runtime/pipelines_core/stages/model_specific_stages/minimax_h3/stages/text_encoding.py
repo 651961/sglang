@@ -113,6 +113,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         return (
             plan.task,
             plan.prompt,
+            bool(batch.extra.get("minimax_h3_refinement_video")),
             materials,
             self.freeze_for_dedup(plan.shape),
         )

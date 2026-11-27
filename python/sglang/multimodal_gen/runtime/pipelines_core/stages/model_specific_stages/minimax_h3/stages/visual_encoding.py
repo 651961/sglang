@@ -27,8 +27,12 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 
 
+from ..refinement import REFINEMENT_EXTRA
+
+
 class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
     deduplicated_extra_output_keys = (
+        REFINEMENT_EXTRA,
         MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY,
         MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY,
         MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY,
@@ -96,6 +100,8 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             )
 
             output_keys = self._visual_output_keys(plan, routed)
+            if batch.extra.get("minimax_h3_refinement_video"):
+                output_keys += (REFINEMENT_EXTRA,)
             replica_world, replica_rank = minimax_h3_replica_ctx()
             parallel_encode = replica_world > 1 and bool(self.video_vae.parallel_tiling)
             owner_exception = None
@@ -252,11 +258,12 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             width, height = item["canvas_width"], item["canvas_height"]
             # The encode sampling seed is pinned at 42 (the VAE sample
             # seed is part of the contract), independent of the request seed.
-            rows = minimax_h3_encode_keyframe_cond_rows(
-                self.video_vae,
-                image,
-                self.vae_arch_config,
-            )
+            if source := batch.extra.get("minimax_h3_refinement_video"):
+                rows = self._encode_refinement(batch, plan, source, image)
+            else:
+                rows = minimax_h3_encode_keyframe_cond_rows(
+                    self.video_vae, image, self.vae_arch_config
+                )
             encoded.append(
                 {
                     "rows": rows,
@@ -283,6 +290,29 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             "pixel_frame_indices": prepared.get("pixel_frame_indices"),
             "frame_count": prepared.get("frame_count"),
         }
+
+    def _encode_refinement(self, batch, plan, source, image):
+        from ..material_io import minimax_h3_probe_material
+        from ..refinement import (
+            encode_refinement_rows,
+            refinement_audio,
+            refinement_frames,
+        )
+
+        facts = minimax_h3_probe_material(
+            batch, source, condition_index=len(plan.materials), condition_type="video"
+        )
+        count = int(plan.shape["frame_count"])
+        frames = refinement_frames(facts["local_path"], image, count)
+        batch.extra[REFINEMENT_EXTRA] = {
+            "rows": encode_refinement_rows(
+                self.video_vae, frames, self.vae_arch_config
+            ),
+            "waveform": refinement_audio(facts, count),
+        }
+        return encode_refinement_rows(
+            self.video_vae, frames[:1], self.vae_arch_config, keyframe=True
+        )
 
     @use_gpu_conditioning_hash()
     def _encode_reference_video(self, batch: Req, plan) -> None:

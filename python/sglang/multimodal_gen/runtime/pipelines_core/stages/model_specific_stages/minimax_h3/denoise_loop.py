@@ -517,6 +517,7 @@ def minimax_h3_denoise_loop(
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     rollout_ctx=None,
     renoise_generator: torch.Generator | None = None,
+    silent_audio_condition: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -624,7 +625,12 @@ def minimax_h3_denoise_loop(
         rollout_ctx.batch._h3_rollout_sigma_max = float(max(sigmas_video))
         video_target = video_rows[video_target_slice]
         rollout_ctx.collector.record_initial(video_target.detach().clone())
+    # The SR cache uses a zero clean audio latent and one Gaussian draw.
+    # Recreate its marginal at each paired audio timestep (no audio loss).
+    audio_noise = audio_rows.clone() if silent_audio_condition else None
     for step in range(num_steps):
+        if audio_noise is not None:
+            torch.mul(audio_noise, audio_sigmas[step], out=audio_rows)
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v = sigmas_video[step]
@@ -712,7 +718,7 @@ def minimax_h3_denoise_loop(
                         sigma_next=sigmas_audio[step + 1],
                         generator=renoise_generator,
                     )
-                else:
+                elif not silent_audio_condition:
                     _minimax_h3_update_target_rows_(
                         audio_target,
                         mv_audio_t,

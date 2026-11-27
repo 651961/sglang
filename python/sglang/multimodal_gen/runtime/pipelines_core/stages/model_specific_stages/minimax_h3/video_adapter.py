@@ -65,6 +65,7 @@ class MiniMaxH3VideoModelAdapter:
             "conditions",
             "target",
             "audio_flow_shift",
+            "refinement_video",
             "audio_guidance_scale",
             "quality",
             "output_mode",
@@ -191,6 +192,8 @@ class MiniMaxH3VideoModelAdapter:
                 ),
             }
         )
+        if (source := _extra_value(request, "refinement_video")) is not None:
+            kwargs["refinement_video"] = source
         reference_resize_mode = _parse_extra_value(
             _extra_value(request, "reference_resize_mode")
         )

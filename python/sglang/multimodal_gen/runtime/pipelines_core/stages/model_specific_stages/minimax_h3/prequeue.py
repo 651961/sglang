@@ -78,6 +78,8 @@ def _resolve_deferred_spatial_shape(
     plan: MiniMaxH3ResolvedPlan,
     shape: dict[str, Any],
     probe_facts: dict[int, dict[str, Any]],
+    *,
+    refinement: bool = False,
 ) -> None:
     if str(shape.get("geometry")) != "deferred":
         return
@@ -122,6 +124,7 @@ def _resolve_deferred_spatial_shape(
             width=width,
             height=height,
             base_short_edge=int(shape["base_short_edge"]),
+            refinement=refinement,
         )
     )
     shape["geometry_source"] = geometry_source
@@ -309,9 +312,22 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
             probe_facts[int(material.condition_index)] = facts
         batch.extra[MINIMAX_H3_PROBE_FACTS_EXTRA_KEY] = probe_facts
 
+        if source := batch.extra.get("minimax_h3_refinement_video"):
+            # Localize once before replica workers enter VAE tile collectives.
+            minimax_h3_probe_material(
+                batch,
+                source,
+                condition_type="video",
+                condition_index=len(plan.materials),
+            )
         shape = dict(plan.shape)
         _validate_reference_start_times(plan, probe_facts)
-        _resolve_deferred_spatial_shape(plan, shape, probe_facts)
+        _resolve_deferred_spatial_shape(
+            plan,
+            shape,
+            probe_facts,
+            refinement=bool(batch.extra.get("minimax_h3_refinement_video")),
+        )
         _resolve_deferred_temporal_shape(plan, shape, probe_facts)
         if str(shape.get("geometry")) != "resolved_v2":
             raise ValueError(

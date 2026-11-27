@@ -141,6 +141,15 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             audio_noise = torch.randn(
                 audio_rows_n, 32, generator=gen_a, dtype=torch.float32
             )
+        if batch.extra.get("minimax_h3_refinement_video"):
+            from ..refinement import REFINEMENT_EXTRA, T_THRESH
+
+            source = batch.extra[REFINEMENT_EXTRA].pop("rows")
+            if source.shape != video_noise.shape:
+                raise ValueError(
+                    f"Refinement latent shape {source.shape} differs from target {video_noise.shape}"
+                )
+            video_noise = torch.lerp(source.float(), video_noise, T_THRESH)
         if list(video_noise.shape) != [video_rows_n, 96]:
             raise ValueError(
                 f"aligned video noise shape {list(video_noise.shape)} != "

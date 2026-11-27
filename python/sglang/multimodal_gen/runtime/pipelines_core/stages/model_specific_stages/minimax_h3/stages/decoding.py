@@ -668,9 +668,18 @@ class MiniMaxH3DecodingStage(DecodingStage):
         # Replica rank 0 decodes the audio, alongside its video tiles on CUDA
         # or before them while the other ranks start theirs; everyone else
         # receives it after the video decode.
-        overlap_audio = self._overlaps_audio_decode(server_args)
+        from ..refinement import REFINEMENT_EXTRA
+
+        refinement = batch.extra.get(REFINEMENT_EXTRA)
+        overlap_audio = refinement is None and self._overlaps_audio_decode(server_args)
         owner_audio, owner_exception, audio_job = None, None, None
-        if overlap_audio:
+        if refinement is not None:
+            if (
+                not model_parallel_is_initialized()
+                or get_replica_group().rank_in_group == 0
+            ):
+                owner_audio = {"waveform": refinement["waveform"], "sample_rate": 32000}
+        elif overlap_audio:
             audio_job = self._start_owner_audio(
                 audio_latent,
                 server_args,

@@ -124,6 +124,7 @@ def minimax_h3_resolve_spatial_shape(
     width: int | float,
     height: int | float,
     base_short_edge: int = MINIMAX_H3_BASE_SHORT_EDGE,
+    refinement: bool = False,
 ) -> dict[str, Any]:
     """Resolve one display ratio with the ``adapt_shape_v1`` math.
 
@@ -165,9 +166,11 @@ def minimax_h3_resolve_spatial_shape(
         nominal_width = float(base_short_edge)
         nominal_height = float(base_short_edge) / ratio
     nominal_area = nominal_width * nominal_height
-    if nominal_area > MINIMAX_H3_MAX_PIXELS:
+    # VeOmni SR caches use a 2 Mi-pixel budget and floor each spatial axis.
+    max_pixels = 2_097_152 if refinement else MINIMAX_H3_MAX_PIXELS
+    if nominal_area > max_pixels:
         size_mode = "area"
-        scale = math.sqrt(float(MINIMAX_H3_MAX_PIXELS) / nominal_area)
+        scale = math.sqrt(max_pixels / nominal_area)
         nominal_width *= scale
         nominal_height *= scale
     else:
@@ -176,15 +179,21 @@ def minimax_h3_resolve_spatial_shape(
     resolved_width = _nearest_multiple(nominal_width, MINIMAX_H3_CANVAS_MULTIPLE)
     resolved_height = _nearest_multiple(nominal_height, MINIMAX_H3_CANVAS_MULTIPLE)
 
+    if refinement:
+        multiple = MINIMAX_H3_CANVAS_MULTIPLE
+        resolved_width = max(multiple, math.floor(nominal_width / multiple) * multiple)
+        resolved_height = max(
+            multiple, math.floor(nominal_height / multiple) * multiple
+        )
     return {
         "geometry": "resolved_v2",
         "shape_policy_version": MINIMAX_H3_SHAPE_POLICY_VERSION,
         "base_short_edge": base_short_edge,
         "effective_short_edge": min(resolved_width, resolved_height),
         "size_mode": size_mode,
-        "max_pixels": MINIMAX_H3_MAX_PIXELS,
+        "max_pixels": max_pixels,
         "multiple": MINIMAX_H3_CANVAS_MULTIPLE,
-        "rounding": "nearest",
+        "rounding": "floor" if refinement else "nearest",
         "width": resolved_width,
         "height": resolved_height,
     }

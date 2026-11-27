@@ -117,8 +117,19 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                     "an explicit PDD sigma grid (pdd_config.json sigmas) is "
                     "supported for MiniMax H3 image releases only"
                 )
-            self._generate_sigmas_from_plan(batch, plan)
-            self._apply_pdd_schedule(batch)
+            if batch.extra.get("minimax_h3_refinement_video"):
+                from ..refinement import refinement_sigmas
+
+                if self._pdd_config is not None or self.dmd_denoising_steps is not None:
+                    raise ValueError(
+                        "FL2VA refinement requires the base Euler checkpoint"
+                    )
+                batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = refinement_sigmas(
+                    batch.num_inference_steps
+                )
+            else:
+                self._generate_sigmas_from_plan(batch, plan)
+                self._apply_pdd_schedule(batch)
         self._publish_native_timestep_state(batch)
         return batch
 
@@ -141,6 +152,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.audio_flow_shift,
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
+            bool(batch.extra.get("minimax_h3_refinement_video")),
             self.freeze_for_dedup(self.sigma_shift_scales),
         )
 

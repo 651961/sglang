@@ -829,13 +829,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         sampling = batch.sampling_params
         imgvid_noise_aug, audio_noise_aug = minimax_h3_condition_noise_aug(sampling)
-        _apply_condition_noise_aug(
-            ctx,
-            sampling=sampling,
-            imgvid_noise_aug=imgvid_noise_aug,
-            audio_noise_aug=audio_noise_aug,
-            stochastic_sampling=self.stochastic_sampling,
-        )
+        is_refinement = bool(batch.extra.get("minimax_h3_refinement_video"))
+        if is_refinement:
+            # The training anchor mixes with 0.999 cast to bf16 (exactly one).
+            imgvid_noise_aug, audio_noise_aug = 0.999, 1.0
+        else:
+            _apply_condition_noise_aug(
+                ctx,
+                sampling=sampling,
+                imgvid_noise_aug=imgvid_noise_aug,
+                audio_noise_aug=audio_noise_aug,
+                stochastic_sampling=self.stochastic_sampling,
+            )
         attn_metadata = _build_cube_attn_metadata(
             server_args,
             packed=packed,
@@ -992,6 +997,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     ),
                     rollout_ctx=rollout_ctx,
                     renoise_generator=renoise_generator,
+                    silent_audio_condition=is_refinement,
                 )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (

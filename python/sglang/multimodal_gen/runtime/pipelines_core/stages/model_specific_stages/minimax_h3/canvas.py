@@ -245,7 +245,11 @@ def minimax_h3_prepared_keyframes(
         # A request's first semantic keyframe is its geometry anchor, including
         # the single-image last-frame-only signature [-1]. Only the second image in the
         # two-keyframe FL extension is a follower and receives cover-crop.
-        if keyframe_fit == "source_crop":
+        if batch.extra.get("minimax_h3_refinement_video"):
+            prepared_image = image.convert("RGB").resize(
+                (canvas_w, canvas_h), Image.Resampling.BICUBIC
+            )
+        elif keyframe_fit == "source_crop":
             prepared_image = minimax_h3_center_crop_keyframe_canvas(
                 image,
                 target_width=canvas_w,

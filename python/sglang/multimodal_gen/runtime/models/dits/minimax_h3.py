@@ -2184,12 +2184,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             x.is_cuda
             and x.dtype == _BF16_DTYPE
             and self.attn.hybrid is None
-            and self.attn.out_proj.tp_size == 2
             and all(
                 type(layer) is RowParallelLinear
                 and type(layer.quant_method) is UnquantizedLinearMethod
                 for layer in (self.attn.out_proj, self.mlp.fc2)
             )
+            and self.attn.out_proj.tp_size == 2
         )
 
     def _mlp_gated_residual(
